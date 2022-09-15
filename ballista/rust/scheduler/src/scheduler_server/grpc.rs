@@ -355,6 +355,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             optional_session_id,
         } = query_params
         {
+            println!("execute_query");
+
             // parse config
             let mut config_builder = BallistaConfig::builder();
             for kv_pair in &settings {

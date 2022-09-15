@@ -24,6 +24,7 @@ use ballista_core::serde::protobuf::{self, KeyValuePair};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use std::sync::Arc;
+use datafusion::common::ScalarValue;
 
 #[derive(Clone)]
 pub struct SessionManager {
@@ -83,6 +84,8 @@ impl SessionManager {
         }
         let config = config_builder.build()?;
 
+        println!("create_session config = {:?}", config);
+
         let ctx = create_datafusion_context(&config, self.session_builder);
 
         let value = encode_protobuf(&protobuf::SessionSettings { configs: settings })?;
@@ -110,16 +113,21 @@ impl SessionManager {
 
 /// Create a DataFusion session context that is compatible with Ballista Configuration
 pub fn create_datafusion_context(
-    config: &BallistaConfig,
+    ballista_config: &BallistaConfig,
     session_builder: SessionBuilder,
 ) -> Arc<SessionContext> {
-    let config = SessionConfig::new()
-        .with_target_partitions(config.default_shuffle_partitions())
-        .with_batch_size(config.default_batch_size())
-        .with_repartition_joins(config.repartition_joins())
-        .with_repartition_aggregations(config.repartition_aggregations())
-        .with_repartition_windows(config.repartition_windows())
-        .with_parquet_pruning(config.parquet_pruning());
+    let mut config = SessionConfig::new()
+        .with_target_partitions(ballista_config.default_shuffle_partitions())
+        .with_batch_size(ballista_config.default_batch_size())
+        .with_repartition_joins(ballista_config.repartition_joins())
+        .with_repartition_aggregations(ballista_config.repartition_aggregations())
+        .with_repartition_windows(ballista_config.repartition_windows())
+        .with_parquet_pruning(ballista_config.parquet_pruning());
+
+    for (k,v) in ballista_config.settings() {
+        config = config.set(k, ScalarValue::Utf8(Some(v.to_string())));
+    }
+
     let session_state = session_builder(config);
     Arc::new(SessionContext::with_state(session_state))
 }
