@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs::File, pin::Pin};
+use datafusion::common::ScalarValue;
 use tonic::codegen::StdError;
 use tonic::transport::{Channel, Error, Server};
 
@@ -233,9 +234,15 @@ pub fn create_df_ctx_with_ballista_query_planner<T: 'static + AsLogicalPlan>(
     let planner: Arc<BallistaQueryPlanner<T>> =
         Arc::new(BallistaQueryPlanner::new(scheduler_url, config.clone()));
 
-    let session_config = SessionConfig::new()
+    let mut session_config = SessionConfig::new()
         .with_target_partitions(config.default_shuffle_partitions())
         .with_information_schema(true);
+
+    for (k,v) in config.settings() {
+        println!("Setting {} = {}", k, v);
+        session_config = session_config.set(k, ScalarValue::Utf8(Some(v.clone())));
+    }
+
     let mut session_state = SessionState::with_config_rt(
         session_config,
         Arc::new(RuntimeEnv::new(RuntimeConfig::default()).unwrap()),
