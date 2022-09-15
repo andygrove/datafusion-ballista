@@ -24,6 +24,7 @@ use crate::serde::scheduler::PartitionStats;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::{ipc::writer::FileWriter, record_batch::RecordBatch};
+use datafusion::common::ScalarValue;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{
     QueryPlanner, SessionConfig, SessionContext, SessionState,
@@ -52,7 +53,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs::File, pin::Pin};
-use datafusion::common::ScalarValue;
 use tonic::codegen::StdError;
 use tonic::transport::{Channel, Error, Server};
 
@@ -238,7 +238,7 @@ pub fn create_df_ctx_with_ballista_query_planner<T: 'static + AsLogicalPlan>(
         .with_target_partitions(config.default_shuffle_partitions())
         .with_information_schema(true);
 
-    for (k,v) in config.settings() {
+    for (k, v) in config.settings() {
         println!("Setting {} = {}", k, v);
         session_config = session_config.set(k, ScalarValue::Utf8(Some(v.clone())));
     }
