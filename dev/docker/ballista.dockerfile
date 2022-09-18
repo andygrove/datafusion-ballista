@@ -48,9 +48,9 @@ ARG PROTOC_VERSION=21.4
 
 RUN mkdir /tmp/protoc
 WORKDIR /tmp/protoc
-
+RUN bash --version
 RUN CPU_ARCH=`uname -m` && \
-  if [ $CPU_ARCH == "aarch64" ]; then CPU_ARCH="aarch_64"; fi && \
+  if [ "$CPU_ARCH" == "aarch64" ]; then CPU_ARCH="aarch_64"; fi && \
   export PROTO_ZIP="protoc-${PROTOC_VERSION}-linux-${CPU_ARCH}.zip" && \
   curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTO_ZIP && \
   unzip $PROTO_ZIP
