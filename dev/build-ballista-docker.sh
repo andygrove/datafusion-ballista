@@ -19,9 +19,15 @@
 
 set -e
 
+docker build -t apache/arrow-ballista-base -f dev/docker/ballista-base.Dockerfile .
+docker build -t apache/arrow-ballista -f dev/docker/ballista.Dockerfile .
+docker build -t apache/arrow-ballista-executor -f dev/docker/ballista-executor.Dockerfile .
+docker build -t apache/arrow-ballista-scheduler -f dev/docker/ballista-scheduler.Dockerfile .
+docker build -t apache/arrow-ballista-benchmarks -f dev/docker/ballista-benchmarks.Dockerfile .
+
 . ./dev/build-set-env.sh
-docker build -t apache/arrow-ballista-base:$BALLISTA_VERSION -f dev/docker/ballista-base.Dockerfile .
-docker build --build-arg VERSION=$BALLISTA_VERSION -t apache/arrow-ballista:$BALLISTA_VERSION -f dev/docker/ballista.Dockerfile .
-docker build --build-arg VERSION=$BALLISTA_VERSION -t apache/arrow-ballista-executor:$BALLISTA_VERSION -f dev/docker/ballista-executor.Dockerfile .
-docker build --build-arg VERSION=$BALLISTA_VERSION -t apache/arrow-ballista-scheduler:$BALLISTA_VERSION -f dev/docker/ballista-scheduler.Dockerfile .
-docker build --build-arg VERSION=$BALLISTA_VERSION -t apache/arrow-ballista-benchmarks:$BALLISTA_VERSION -f dev/docker/ballista-benchmarks.Dockerfile .
+docker tag apache/arrow-ballista-base "apache/arrow-ballista-base:$BALLISTA_VERSION"
+docker tag apache/arrow-ballista "apache/arrow-ballista:$BALLISTA_VERSION"
+docker tag apache/arrow-ballista-executor "apache/arrow-ballista-executor:$BALLISTA_VERSION"
+docker tag apache/arrow-ballista-scheduler "apache/arrow-ballista-scheduler:$BALLISTA_VERSION"
+docker tag apache/arrow-ballista-benchmarks "apache/arrow-ballista-benchmarks:$BALLISTA_VERSION"

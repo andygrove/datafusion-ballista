@@ -15,8 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG VERSION
-FROM apache/arrow-ballista:$VERSION
+FROM apache/arrow-ballista
 
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=full

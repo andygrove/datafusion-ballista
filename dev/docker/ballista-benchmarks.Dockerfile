@@ -15,8 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG VERSION
-FROM apache/arrow-ballista:$VERSION
+FROM apache/arrow-ballista
 
 ADD benchmarks/run.sh /
 RUN mkdir /queries

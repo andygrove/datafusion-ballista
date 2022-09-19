@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG VERSION
-
 # Use node image to build the scheduler UI
 FROM node:14.16.0-alpine as ui-build
 WORKDIR /app
@@ -25,7 +23,7 @@ COPY ballista/ui/scheduler ./
 RUN yarn
 RUN yarn build
 
-FROM apache/arrow-ballista:$VERSION
+FROM apache/arrow-ballista
 RUN apt -y install nginx
 RUN rm -rf /var/www/html/*
 COPY --from=ui-build /app/build /var/www/html
