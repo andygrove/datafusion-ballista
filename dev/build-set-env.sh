@@ -17,4 +17,4 @@
 # specific language governing permissions and limitations
 # under the License.
 
-export BALLISTA_VERSION=$(awk -F'[ ="]+' '$1 == "version" { print $2 }' ballista/rust/core/Cargo.toml)
+export BALLISTA_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ballista").version')
