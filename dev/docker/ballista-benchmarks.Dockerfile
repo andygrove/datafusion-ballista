@@ -15,13 +15,42 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM apache/arrow-ballista
+FROM rust:1.63.0-buster
 
-ADD benchmarks/run.sh /
-RUN mkdir /queries
-COPY benchmarks/queries/ /queries/
+ARG RELEASE_FLAG=--release
 
+ENV RELEASE_FLAG=${RELEASE_FLAG}
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=full
+ENV FORCE_REBUILD='true'
+
+RUN apt-get update && \
+    apt-get -y install libssl-dev openssl zlib1g zlib1g-dev libpq-dev cmake protobuf-compiler netcat && \
+    rm -rf /var/lib/apt/lists/*
+
+# prepare toolchain
+RUN rustup update && \
+    rustup component add rustfmt && \
+    cargo install cargo-chef --version 0.1.34
+
+WORKDIR /tmp/ballista
+
+ADD Cargo.toml .
+COPY ballista/ ./ballista
+COPY ballista-cli/ ./ballista-cli
+COPY examples/ ./examples
+COPY benchmarks/ ./benchmarks
+
+# force build.rs to run to generate configure_me code.
+RUN cargo build $RELEASE_FLAG && \
+    mv target/**/ballista-scheduler /scheduler && \
+    mv target/**/ballista-executor /executor && \
+    mv target/**/tpch /tpch && \
+    rm -rf /tmp/*
+
+WORKDIR /
+
+ADD benchmarks/run.sh /
+COPY benchmarks/queries/ /benchmarks/queries
 
 CMD ["/run.sh"]

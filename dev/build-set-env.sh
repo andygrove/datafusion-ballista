@@ -17,4 +17,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-export BALLISTA_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ballista").version')
+cd ballista/rust/core/
+export BALLISTA_VERSION=$(cargo pkgid | cut '-d@' -f2)
+cd -

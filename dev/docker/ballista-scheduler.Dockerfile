@@ -15,21 +15,47 @@
 # specific language governing permissions and limitations
 # under the License.
 
+FROM rust:1.63.0-buster as rust-build
+
+ARG RELEASE_FLAG=--release
+
+ENV RELEASE_FLAG=${RELEASE_FLAG}
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=full
+ENV FORCE_REBUILD='true'
+
+RUN apt-get update && \
+    apt-get -y install libssl-dev openssl zlib1g zlib1g-dev libpq-dev cmake protobuf-compiler netcat nginx && \
+    rm -rf /var/www/html/* && \
+    rm -rf /var/lib/apt/lists/*
+
+# prepare toolchain
+RUN rustup update && \
+    rustup component add rustfmt && \
+    cargo install cargo-chef --version 0.1.34
+
+WORKDIR /tmp/ballista
+
+ADD Cargo.toml .
+COPY ballista/ ./ballista
+COPY ballista-cli/ ./ballista-cli
+COPY examples/ ./examples
+COPY benchmarks/ ./benchmarks
+
+# force build.rs to run to generate configure_me code.
+RUN cargo build --features flight-sql --manifest-path ballista/rust/scheduler/Cargo.toml $RELEASE_FLAG && \
+    mv target/**/ballista-scheduler /scheduler && \
+    rm -rf /tmp/*
+
 # Use node image to build the scheduler UI
 FROM node:14.16.0-alpine as ui-build
 WORKDIR /app
 ENV PATH /app/node_modules/.bin:$PATH
 COPY ballista/ui/scheduler ./
-RUN yarn
-RUN yarn build
+RUN yarn install && yarn build
 
-FROM apache/arrow-ballista
-RUN apt -y install nginx
-RUN rm -rf /var/www/html/*
+FROM rust-build
 COPY --from=ui-build /app/build /var/www/html
-
-ENV RUST_LOG=info
-ENV RUST_BACKTRACE=full
 
 # Expose Ballista Scheduler web UI port
 EXPOSE 80

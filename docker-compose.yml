@@ -14,32 +14,59 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-version: "3.9"
+version: '3.8'
 services:
-  scheduler:
-    build:
-      context: .
-      Dockerfile: scheduler.Dockerfile
+  etcd:
+    image: quay.io/coreos/etcd:v3.4.9
+    command: "etcd -advertise-client-urls http://etcd:2379 -listen-client-urls http://0.0.0.0:2379"
     ports:
-      - "50050:50050"
-
-  executor:
+      - 2379:2379
+  ballista-scheduler:
     build:
+      dockerfile: dev/docker/ballista-scheduler.Dockerfile
       context: .
-      Dockerfile: executor.Dockerfile
-    command: ./ballista-executor --scheduler-host=scheduler
-    ports:
-      - "50051:50051"
+    command: "--config-backend etcd --etcd-urls etcd:2379 --bind-host 0.0.0.0 --bind-port 50050"
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./benchmarks/data:/data
     depends_on:
-      - scheduler
-    links:
-      - scheduler
-
-  minio:
-    image: minio/minio:latest
-    hostname: localhost
-    command: server /root
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      - etcd
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "127.0.0.1", "50050"]
+      interval: 5s
+      timeout: 1s
+      retries: 5
+  ballista-executor:
+    build:
+      dockerfile: dev/docker/ballista-executor.Dockerfile
+      context: .
+    command: "--bind-host 0.0.0.0 --bind-port 50051 --scheduler-host ballista-scheduler"
+    deploy:
+      replicas: 2
+    environment:
+      - RUST_LOG=ballista=debug,info
+    volumes:
+      - ./benchmarks/data:/data
+    depends_on:
+      ballista-scheduler:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "127.0.0.1", "50051"]
+      interval: 5s
+      timeout: 1s
+      retries: 5
+  ballista-client:
+    build:
+      dockerfile: dev/docker/ballista-benchmarks.Dockerfile
+      context: .
+    command: ["/bin/sh", "sleep", "infinity"]
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./benchmarks/data:/data
+    depends_on:
+      ballista-scheduler:
+        condition: service_healthy
+      ballista-executor:
+        condition: service_healthy

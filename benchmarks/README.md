@@ -131,10 +131,7 @@ cargo run --release --bin tpch benchmark ballista --host localhost --port 50050 
 To start a Rust scheduler and executor using Docker Compose:
 
 ```bash
-cd $ARROW_HOME
-./dev/build-rust.sh
-cd $ARROW_HOME/benchmarks
-docker-compose up
+docker-compose up --build
 ```
 
 Then you can run the benchmark with:
