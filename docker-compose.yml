@@ -1,0 +1,28 @@
+version: "3.9"
+services:
+  scheduler:
+    build:
+      context: .
+      dockerfile: scheduler.Dockerfile
+    ports:
+      - "50050:50050"
+
+  executor:
+    build:
+      context: .
+      dockerfile: executor.Dockerfile
+    command: ./ballista-executor --scheduler-host=scheduler
+    ports:
+      - "50051:50051"
+    depends_on:
+      - scheduler
+    links:
+      - scheduler
+
+  minio:
+    image: minio/minio:latest
+    hostname: localhost
+    command: server /root
+    ports:
+      - "9000:9000"
+      - "9001:9001"
