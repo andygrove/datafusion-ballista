@@ -20,14 +20,14 @@ services:
   scheduler:
     build:
       context: .
-      dockerfile: scheduler.Dockerfile
+      Dockerfile: scheduler.Dockerfile
     ports:
       - "50050:50050"
 
   executor:
     build:
       context: .
-      dockerfile: executor.Dockerfile
+      Dockerfile: executor.Dockerfile
     command: ./ballista-executor --scheduler-host=scheduler
     ports:
       - "50051:50051"
