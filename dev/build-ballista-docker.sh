@@ -23,9 +23,9 @@ docker build -t ballista-builder --build-arg EXT_UID="$(id -u)" -f dev/docker/ba
 
 docker run -v $(pwd):/home/builder/workspace ballista-builder
 
-docker-compose build
+docker compose build
 
 . ./dev/build-set-env.sh
-docker tag apache/arrow-ballista-executor "apache/arrow-ballista-executor:$BALLISTA_VERSION"
-docker tag apache/arrow-ballista-scheduler "apache/arrow-ballista-scheduler:$BALLISTA_VERSION"
-docker tag apache/arrow-ballista-benchmarks "apache/arrow-ballista-benchmarks:$BALLISTA_VERSION"
+docker tag ballista-executor "apache/arrow-ballista-executor:$BALLISTA_VERSION"
+docker tag ballista-scheduler "apache/arrow-ballista-scheduler:$BALLISTA_VERSION"
+docker tag ballista-benchmarks "apache/arrow-ballista-benchmarks:$BALLISTA_VERSION"

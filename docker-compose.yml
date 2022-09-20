@@ -48,7 +48,7 @@ services:
     depends_on:
       - ballista-scheduler
   ballista-client:
-    image: ballista-client
+    image: ballista-benchmarks
     build:
       dockerfile: dev/docker/ballista-benchmarks.Dockerfile
       context: .
