@@ -137,7 +137,7 @@ docker-compose up --build
 Then you can run the benchmark with:
 
 ```bash
-docker-compose run ballista-client bash -c '/tpch benchmark ballista --host ballista-scheduler --port 50050 --query 1 --path /data --format tbl'
+docker-compose run ballista-client bash -c '/root/tpch benchmark ballista --host ballista-scheduler --port 50050 --query 1 --path /data --format tbl'
 ```
 
 ## Expected output

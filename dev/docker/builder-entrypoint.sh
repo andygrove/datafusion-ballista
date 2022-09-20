@@ -1,3 +1,5 @@
+#!/bin/bash
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,10 +17,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:22.04
+set -x
 
-COPY ./target/release/ballista-scheduler .
+printenv
+RELEASE_FLAG=${RELEASE_FLA:=release}
+cargo build --features flight-sql "--$RELEASE_FLAG" "$@"
 
-EXPOSE 50050
-
-CMD ./ballista-scheduler
+cd ballista/ui/scheduler
+yarn install
+yarn build

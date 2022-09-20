@@ -15,42 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.63.0-buster
+FROM ubuntu:22.04
 
-ARG RELEASE_FLAG=--release
+ARG RELEASE_FLAG=release
 
 ENV RELEASE_FLAG=${RELEASE_FLAG}
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=full
-ENV FORCE_REBUILD='true'
 
-RUN apt-get update && \
-    apt-get -y install libssl-dev openssl zlib1g zlib1g-dev libpq-dev cmake protobuf-compiler netcat && \
-    rm -rf /var/lib/apt/lists/*
+COPY target/$RELEASE_FLAG/ballista-scheduler /root/ballista-scheduler
+COPY target/$RELEASE_FLAG/ballista-executor /root/ballista-executor
+COPY target/$RELEASE_FLAG/tpch /root/tpch
 
-# prepare toolchain
-RUN rustup update && \
-    rustup component add rustfmt && \
-    cargo install cargo-chef --version 0.1.34
+COPY benchmarks/run.sh /root/run.sh
+COPY benchmarks/queries/ /root/benchmarks/queries
 
-WORKDIR /tmp/ballista
+WORKDIR /root
 
-ADD Cargo.toml .
-COPY ballista/ ./ballista
-COPY ballista-cli/ ./ballista-cli
-COPY examples/ ./examples
-COPY benchmarks/ ./benchmarks
-
-# force build.rs to run to generate configure_me code.
-RUN cargo build $RELEASE_FLAG && \
-    mv target/**/ballista-scheduler /scheduler && \
-    mv target/**/ballista-executor /executor && \
-    mv target/**/tpch /tpch && \
-    rm -rf /tmp/*
-
-WORKDIR /
-
-ADD benchmarks/run.sh /
-COPY benchmarks/queries/ /benchmarks/queries
-
-CMD ["/run.sh"]
+CMD ["/root/run.sh"]
