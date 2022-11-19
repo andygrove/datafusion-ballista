@@ -39,7 +39,7 @@ sled = ["sled_package", "tokio-stream"]
 
 [dependencies]
 anyhow = "1"
-arrow-flight = { version = "26.0.0", features = ["flight-sql-experimental"] }
+arrow-flight = { version = "27.0.0", features = ["flight-sql-experimental"] }
 async-recursion = "1.0.0"
 async-trait = "0.1.41"
 ballista-core = { path = "../core", version = "0.10.0" }
@@ -47,8 +47,8 @@ base64 = { version = "0.13", default-features = false }
 clap = { version = "3", features = ["derive", "cargo"] }
 configure_me = "0.4.0"
 dashmap = "5.4.0"
-datafusion = "14.0.0"
-datafusion-proto = "14.0.0"
+datafusion = { git = "https://github.com/apache/arrow-datafusion", rev = "880e6fc2faa0d1974a4af9c9a4585b79b6cd500b" }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion", rev = "880e6fc2faa0d1974a4af9c9a4585b79b6cd500b" }
 etcd-client = { version = "0.10", optional = true }
 flatbuffers = { version = "22.9.29" }
 futures = "0.3"

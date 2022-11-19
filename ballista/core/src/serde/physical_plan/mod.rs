@@ -331,6 +331,8 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     physical_window_expr,
                     input,
                     Arc::new((&input_schema).try_into()?),
+                    vec![], // TODO
+                    None // TODO
                 )?))
             }
             PhysicalPlanType::Aggregate(hash_agg) => {
@@ -1272,6 +1274,7 @@ fn decode_scan_config(
         projection,
         limit: proto.limit.as_ref().map(|sl| sl.limit as usize),
         table_partition_cols: vec![],
+        output_ordering: None // TODO
     })
 }
 
