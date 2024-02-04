@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::arrow::pyarrow::ToPyArrow;
 use datafusion::prelude::DataFrame;
 use pyo3::prelude::*;
 use std::future::Future;
@@ -66,14 +67,10 @@ impl PyDataFrame {
     /// Unless some order is specified in the plan, there is no
     /// guarantee of the order of the result.
     fn collect(&self, py: Python) -> PyResult<Vec<PyObject>> {
-        let _batches = wait_for_future(py, self.df.as_ref().clone().collect()).unwrap();
+        let batches = wait_for_future(py, self.df.as_ref().clone().collect()).unwrap();
         // cannot use PyResult<Vec<RecordBatch>> return type due to
         // https://github.com/PyO3/pyo3/issues/1813
-
-        //TODO
-        //batches.into_iter().map(|rb| rb.to_pyarrow(py)).collect()
-
-        Ok(vec![])
+        batches.into_iter().map(|rb| rb.to_pyarrow(py)).collect()
     }
 }
 
