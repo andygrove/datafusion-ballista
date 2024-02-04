@@ -15,18 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::prelude::DataFrame;
 use pyo3::prelude::*;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use datafusion::prelude::DataFrame;
 
 use ballista::prelude::*;
 
 /// PyBallista SessionContext
 #[pyclass(name = "SessionContext", module = "pyballista", subclass)]
 pub struct PySessionContext {
-    ctx: BallistaContext
+    ctx: BallistaContext,
 }
 
 #[pymethods]
@@ -36,9 +36,7 @@ impl PySessionContext {
         let config = BallistaConfig::new().unwrap();
         let ballista_context = BallistaContext::remote(host, port, &config);
         let ctx = wait_for_future(py, ballista_context).unwrap();
-        Ok(Self {
-            ctx
-        })
+        Ok(Self { ctx })
     }
 
     pub fn sql(&mut self, query: &str, py: Python) -> PyResult<PyDataFrame> {
@@ -68,7 +66,7 @@ impl PyDataFrame {
     /// Unless some order is specified in the plan, there is no
     /// guarantee of the order of the result.
     fn collect(&self, py: Python) -> PyResult<Vec<PyObject>> {
-        let batches = wait_for_future(py, self.df.as_ref().clone().collect()).unwrap();
+        let _batches = wait_for_future(py, self.df.as_ref().clone().collect()).unwrap();
         // cannot use PyResult<Vec<RecordBatch>> return type due to
         // https://github.com/PyO3/pyo3/issues/1813
 
@@ -77,13 +75,12 @@ impl PyDataFrame {
 
         Ok(vec![])
     }
-
 }
 
 fn wait_for_future<F: Future>(py: Python, f: F) -> F::Output
-    where
-        F: Send,
-        F::Output: Send,
+where
+    F: Send,
+    F::Output: Send,
 {
     let runtime: &Runtime = &get_tokio_runtime(py).0;
     py.allow_threads(|| runtime.block_on(f))
