@@ -15,28 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//use pyo3::{pyclass, pymodule, Python, PyResult, types::PyModule, pymethods};
 use pyo3::prelude::*;
 use std::future::Future;
 use tokio::runtime::Runtime;
 
-use datafusion::prelude::SessionContext as DFSessionContext;
+use ballista::prelude::*;
 
 /// PyBallista SessionContext
-#[pyclass(name = "SessionContext", module = "ballista", subclass)]
-struct SessionContext {
-    ctx: DFSessionContext
-}
-
-impl SessionContext {
+#[pyclass(name = "SessionContext", module = "pyballista", subclass)]
+pub struct PySessionContext {
+    ctx: BallistaContext
 }
 
 #[pymethods]
-impl SessionContext {
+impl PySessionContext {
     #[new]
-    pub fn new() -> PyResult<Self> {
+    pub fn new(host: &str, port: u16, py: Python) -> PyResult<Self> {
+        let config = BallistaConfig::new().unwrap();
+        let ballista_context = BallistaContext::remote(host, port, &config);
+        let ctx = wait_for_future(py, ballista_context).unwrap();
         Ok(Self {
-            ctx: DFSessionContext::new()
+            ctx
         })
     }
 
@@ -74,6 +73,11 @@ pub(crate) struct TokioRuntime(tokio::runtime::Runtime);
 
 #[pymodule]
 fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<SessionContext>()?;
+    // Register the Tokio Runtime as a module attribute so we can reuse it
+    m.add(
+        "runtime",
+        TokioRuntime(tokio::runtime::Runtime::new().unwrap()),
+    )?;
+    m.add_class::<PySessionContext>()?;
     Ok(())
 }
