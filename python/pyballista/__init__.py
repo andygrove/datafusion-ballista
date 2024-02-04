@@ -27,10 +27,12 @@ import pyarrow as pa
 
 from ._internal import (
     SessionContext,
+    DataFrame
 )
 
 __version__ = importlib_metadata.version(__name__)
 
 __all__ = [
     "SessionContext",
+    "DataFrame",
 ]

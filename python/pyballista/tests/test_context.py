@@ -18,4 +18,8 @@ from pyballista import SessionContext
 import pytest
 
 def test_create_context():
-    SessionContext()
+    SessionContext("localhost", 50050)
+
+def test_select_one():
+    ctx = SessionContext("localhost", 50050)
+    ctx.sql("SELECT 1")

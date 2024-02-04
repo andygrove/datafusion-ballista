@@ -17,7 +17,9 @@
 
 use pyo3::prelude::*;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
+use datafusion::prelude::DataFrame;
 
 use ballista::prelude::*;
 
@@ -39,11 +41,43 @@ impl PySessionContext {
         })
     }
 
-    pub fn sql(&mut self, query: &str, py: Python) -> PyResult<()> {
+    pub fn sql(&mut self, query: &str, py: Python) -> PyResult<PyDataFrame> {
         let result = self.ctx.sql(query);
-        let _df = wait_for_future(py, result).unwrap();
-        Ok(())
+        let df = wait_for_future(py, result).unwrap();
+        Ok(PyDataFrame::new(df))
     }
+}
+
+#[pyclass(name = "DataFrame", module = "pyballista", subclass)]
+#[derive(Clone)]
+pub struct PyDataFrame {
+    /// DataFusion DataFrame
+    df: Arc<DataFrame>,
+}
+
+impl PyDataFrame {
+    /// creates a new PyDataFrame
+    pub fn new(df: DataFrame) -> Self {
+        Self { df: Arc::new(df) }
+    }
+}
+
+#[pymethods]
+impl PyDataFrame {
+    /// Executes the plan, returning a list of `RecordBatch`es.
+    /// Unless some order is specified in the plan, there is no
+    /// guarantee of the order of the result.
+    fn collect(&self, py: Python) -> PyResult<Vec<PyObject>> {
+        let batches = wait_for_future(py, self.df.as_ref().clone().collect()).unwrap();
+        // cannot use PyResult<Vec<RecordBatch>> return type due to
+        // https://github.com/PyO3/pyo3/issues/1813
+
+        //TODO
+        //batches.into_iter().map(|rb| rb.to_pyarrow(py)).collect()
+
+        Ok(vec![])
+    }
+
 }
 
 fn wait_for_future<F: Future>(py: Python, f: F) -> F::Output
@@ -79,5 +113,6 @@ fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
         TokioRuntime(tokio::runtime::Runtime::new().unwrap()),
     )?;
     m.add_class::<PySessionContext>()?;
+    m.add_class::<PyDataFrame>()?;
     Ok(())
 }
