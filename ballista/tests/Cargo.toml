@@ -29,6 +29,7 @@ edition = "2021"
 [dependencies]
 ballista-scheduler = { path = "../scheduler", version = "0.12.0" }
 datafusion = { workspace = true }
+tempfile = "3.12.0"
 tokio = "1.40.0"
 
 [lib]
