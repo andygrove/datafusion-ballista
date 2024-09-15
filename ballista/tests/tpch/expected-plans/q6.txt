@@ -1,0 +1,26 @@
+select
+	sum(l_extendedprice * l_discount) as revenue
+from
+	lineitem
+where
+	l_shipdate >= date '1994-01-01'
+	and l_shipdate < date '1994-01-01' + interval '1' year
+	and l_discount between 0.04 - 0.01 and 0.04 + 0.01
+	and l_quantity < 24;
+
+
+Query Stage 0:
+ShuffleWriterExec: None
+  AggregateExec: mode=Partial, gby=[], aggr=[SUM(lineitem.l_extendedprice * lineitem.l_discount)]
+    ProjectionExec: expr=[l_extendedprice@1 as l_extendedprice, l_discount@2 as l_discount]
+      CoalesceBatchesExec: target_batch_size=8192
+        FilterExec: l_shipdate@3 >= 8766 AND l_shipdate@3 < 9131 AND l_discount@2 >= Some(3),11,2 AND l_discount@2 <= Some(5),11,2 AND l_quantity@0 < Some(2400),11,2
+          ParquetExec: file_groups={32 groups: [[mnt/bigdata/tpch/sf100/lineitem.parquet/part1.parquet:0..734840153], [mnt/bigdata/tpch/sf100/lineitem.parquet/part1.parquet:734840153..1469550136, mnt/bigdata/tpch/sf100/lineitem.parquet/part10.parquet:0..130170], [mnt/bigdata/tpch/sf100/lineitem.parquet/part10.parquet:130170..734970323], [mnt/bigdata/tpch/sf100/lineitem.parquet/part10.parquet:734970323..1469810476], [mnt/bigdata/tpch/sf100/lineitem.parquet/part10.parquet:1469810476..1469811062, mnt/bigdata/tpch/sf100/lineitem.parquet/part11.parquet:0..734839567], [mnt/bigdata/tpch/sf100/lineitem.parquet/part11.parquet:734839567..1469679720], [mnt/bigdata/tpch/sf100/lineitem.parquet/part11.parquet:1469679720..1469792487, mnt/bigdata/tpch/sf100/lineitem.parquet/part12.parquet:0..734727386], [mnt/bigdata/tpch/sf100/lineitem.parquet/part12.parquet:734727386..1469567539], [mnt/bigdata/tpch/sf100/lineitem.parquet/part12.parquet:1469567539..1469576762, mnt/bigdata/tpch/sf100/lineitem.parquet/part13.parquet:0..734830930], [mnt/bigdata/tpch/sf100/lineitem.parquet/part13.parquet:734830930..1469671083], [mnt/bigdata/tpch/sf100/lineitem.parquet/part13.parquet:1469671083..1469839488, mnt/bigdata/tpch/sf100/lineitem.parquet/part14.parquet:0..734671748], [mnt/bigdata/tpch/sf100/lineitem.parquet/part14.parquet:734671748..1469511901], [mnt/bigdata/tpch/sf100/lineitem.parquet/part14.parquet:1469511901..1469647240, mnt/bigdata/tpch/sf100/lineitem.parquet/part15.parquet:0..734704814], [mnt/bigdata/tpch/sf100/lineitem.parquet/part15.parquet:734704814..1469544967], [mnt/bigdata/tpch/sf100/lineitem.parquet/part15.parquet:1469544967..1469833433, mnt/bigdata/tpch/sf100/lineitem.parquet/part16.parquet:0..734551687], [mnt/bigdata/tpch/sf100/lineitem.parquet/part16.parquet:734551687..1469391840], [mnt/bigdata/tpch/sf100/lineitem.parquet/part16.parquet:1469391840..1469765133, mnt/bigdata/tpch/sf100/lineitem.parquet/part2.parquet:0..734466860], [mnt/bigdata/tpch/sf100/lineitem.parquet/part2.parquet:734466860..1469212062, mnt/bigdata/tpch/sf100/lineitem.parquet/part3.parquet:0..94951], [mnt/bigdata/tpch/sf100/lineitem.parquet/part3.parquet:94951..734935104], [mnt/bigdata/tpch/sf100/lineitem.parquet/part3.parquet:734935104..1469775257], [mnt/bigdata/tpch/sf100/lineitem.parquet/part3.parquet:1469775257..1469794280, mnt/bigdata/tpch/sf100/lineitem.parquet/part4.parquet:0..734821130], [mnt/bigdata/tpch/sf100/lineitem.parquet/part4.parquet:734821130..1469661283], [mnt/bigdata/tpch/sf100/lineitem.parquet/part4.parquet:1469661283..1469768080, mnt/bigdata/tpch/sf100/lineitem.parquet/part5.parquet:0..734733356], [mnt/bigdata/tpch/sf100/lineitem.parquet/part5.parquet:734733356..1469573509], [mnt/bigdata/tpch/sf100/lineitem.parquet/part5.parquet:1469573509..1469812961, mnt/bigdata/tpch/sf100/lineitem.parquet/part6.parquet:0..734600701], [mnt/bigdata/tpch/sf100/lineitem.parquet/part6.parquet:734600701..1469440854], [mnt/bigdata/tpch/sf100/lineitem.parquet/part6.parquet:1469440854..1469938331, mnt/bigdata/tpch/sf100/lineitem.parquet/part7.parquet:0..734342676], [mnt/bigdata/tpch/sf100/lineitem.parquet/part7.parquet:734342676..1469182829], [mnt/bigdata/tpch/sf100/lineitem.parquet/part7.parquet:1469182829..1469651669, mnt/bigdata/tpch/sf100/lineitem.parquet/part8.parquet:0..734371313], [mnt/bigdata/tpch/sf100/lineitem.parquet/part8.parquet:734371313..1469211466], [mnt/bigdata/tpch/sf100/lineitem.parquet/part8.parquet:1469211466..1469328494, mnt/bigdata/tpch/sf100/lineitem.parquet/part9.parquet:0..734723125], [mnt/bigdata/tpch/sf100/lineitem.parquet/part9.parquet:734723125..1469563265]]}, projection=[l_quantity, l_extendedprice, l_discount, l_shipdate], predicate=l_shipdate@10 >= 8766 AND l_shipdate@10 < 9131 AND l_discount@6 >= Some(3),11,2 AND l_discount@6 <= Some(5),11,2 AND l_quantity@4 < Some(2400),11,2, pruning_predicate=l_shipdate_max@0 >= 8766 AND l_shipdate_min@1 < 9131 AND l_discount_max@2 >= Some(3),11,2 AND l_discount_min@3 <= Some(5),11,2 AND l_quantity_min@4 < Some(2400),11,2, required_guarantees=[]
+
+Query Stage 1:
+ShuffleWriterExec: None
+  ProjectionExec: expr=[SUM(lineitem.l_extendedprice * lineitem.l_discount)@0 as revenue]
+    AggregateExec: mode=Final, gby=[], aggr=[SUM(lineitem.l_extendedprice * lineitem.l_discount)]
+      CoalescePartitionsExec
+        UnresolvedShuffleExec
+

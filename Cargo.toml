@@ -23,6 +23,7 @@ members = [
     "ballista/core",
     "ballista/executor",
     "ballista/scheduler",
+    "ballista/tests",
     "benchmarks",
     "examples"
 ]
