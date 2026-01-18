@@ -29,6 +29,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
 use std::future::Future;
+use std::io::BufWriter;
 use std::iter::Iterator;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,6 +62,8 @@ use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use log::{debug, info};
+
+use super::shuffle_writer_trait::ShuffleWriter;
 
 /// ShuffleWriterExec represents a section of a query plan that has consistent partitioning and
 /// can be executed as one unit with each partition being executed in parallel. The output of each
@@ -105,7 +108,7 @@ impl std::fmt::Display for ShuffleWriterExec {
 pub struct WriteTracker {
     pub num_batches: usize,
     pub num_rows: usize,
-    pub writer: StreamWriter<File>,
+    pub writer: StreamWriter<BufWriter<File>>,
     pub path: PathBuf,
 }
 
@@ -295,7 +298,8 @@ impl ShuffleWriterExec {
                                                 CompressionType::LZ4_FRAME,
                                             ))?;
 
-                                        let file = File::create(path.clone())?;
+                                        let file =
+                                            BufWriter::new(File::create(path.clone())?);
                                         let mut writer =
                                             StreamWriter::try_new_with_options(
                                                 file,
@@ -323,8 +327,8 @@ impl ShuffleWriterExec {
 
                     for (i, w) in writers.iter_mut().enumerate() {
                         if let Some(w) = w {
-                            let num_bytes = fs::metadata(&w.path)?.len();
                             w.writer.finish()?;
+                            let num_bytes = fs::metadata(&w.path)?.len();
                             debug!(
                                 "Finished writing shuffle partition {} at {:?}. Batches: {}. Rows: {}. Bytes: {}.",
                                 i, w.path, w.num_batches, w.num_rows, num_bytes
@@ -497,6 +501,31 @@ impl ExecutionPlan for ShuffleWriterExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         self.plan.partition_statistics(partition)
+    }
+}
+
+impl ShuffleWriter for ShuffleWriterExec {
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn stage_id(&self) -> usize {
+        self.stage_id
+    }
+
+    fn shuffle_output_partitioning(&self) -> Option<&Partitioning> {
+        self.shuffle_output_partitioning.as_ref()
+    }
+
+    fn input_partition_count(&self) -> usize {
+        self.plan
+            .properties()
+            .output_partitioning()
+            .partition_count()
+    }
+
+    fn clone_box(&self) -> Arc<dyn ShuffleWriter> {
+        Arc::new(self.clone())
     }
 }
 
