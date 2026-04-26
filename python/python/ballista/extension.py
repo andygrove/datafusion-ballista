@@ -140,7 +140,7 @@ class DistributedDataFrame(DataFrame, metaclass=RedefiningDataFrameMeta):
     # session context, and ballista planner.
     #
     def _to_internal_df(self):
-        blob_plan = self.logical_plan().to_proto()
+        blob_plan = self.optimized_logical_plan().to_proto()
         df = create_ballista_data_frame(blob_plan, self.address, self._session_id)
         return df
 
