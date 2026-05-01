@@ -1719,7 +1719,8 @@ impl TaskDescription {
         {
             return shuffle_writer
                 .shuffle_output_partitioning()
-                .partition_count();
+                .map(|partitioning| partitioning.partition_count())
+                .unwrap_or(1);
         }
         // Default fallback
         1

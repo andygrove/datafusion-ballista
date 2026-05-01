@@ -77,8 +77,9 @@ pub struct SortShuffleWriterExec {
     plan: Arc<dyn ExecutionPlan>,
     /// Path to write output streams to
     work_dir: String,
-    /// Shuffle output partitioning (must be Hash partitioning)
-    shuffle_output_partitioning: Partitioning,
+    /// Shuffle output partitioning. `None` means the input is passed through to
+    /// a single output partition without re-partitioning.
+    shuffle_output_partitioning: Option<Partitioning>,
     /// Sort shuffle configuration
     config: SortShuffleConfig,
     /// Execution metrics
@@ -127,22 +128,25 @@ impl SortShuffleWriterExec {
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: String,
-        shuffle_output_partitioning: Partitioning,
+        shuffle_output_partitioning: Option<Partitioning>,
         config: SortShuffleConfig,
     ) -> Result<Self> {
-        // Sort shuffle only supports hash partitioning
-        match &shuffle_output_partitioning {
-            Partitioning::Hash(_, _) => {}
-            other => {
+        if let Some(p) = &shuffle_output_partitioning {
+            if !matches!(p, Partitioning::Hash(_, _)) {
                 return Err(DataFusionError::Plan(format!(
-                    "SortShuffleWriterExec only supports Hash partitioning, got: {other:?}"
+                    "SortShuffleWriterExec only supports Hash or None partitioning, got: {p:?}"
                 )));
             }
         }
 
+        // When no shuffle partitioning is requested, mirror ShuffleWriterExec and
+        // pass the input plan's partitioning through unchanged.
+        let plan_partitioning = shuffle_output_partitioning
+            .clone()
+            .unwrap_or_else(|| plan.properties().output_partitioning().clone());
         let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(plan.schema()),
-            shuffle_output_partitioning.clone(),
+            plan_partitioning,
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         ));
@@ -169,9 +173,10 @@ impl SortShuffleWriterExec {
         self.stage_id
     }
 
-    /// Get the shuffle output partitioning
-    pub fn shuffle_output_partitioning(&self) -> &Partitioning {
-        &self.shuffle_output_partitioning
+    /// Get the shuffle output partitioning, or `None` if the writer passes
+    /// the input through to a single output partition.
+    pub fn shuffle_output_partitioning(&self) -> Option<&Partitioning> {
+        self.shuffle_output_partitioning.as_ref()
     }
 
     /// Get the sort shuffle configuration
@@ -206,10 +211,15 @@ impl SortShuffleWriterExec {
             let mut stream = plan.execute(input_partition, context)?;
             let schema = stream.schema();
 
-            let Partitioning::Hash(exprs, num_output_partitions) = partitioning else {
-                return Err(DataFusionError::Internal(
-                    "Expected hash partitioning".to_string(),
-                ));
+            // None => single output bucket (pass-through); Hash(_, n) => n buckets.
+            let num_output_partitions = match &partitioning {
+                Some(Partitioning::Hash(_, n)) => *n,
+                None => 1,
+                Some(other) => {
+                    return Err(DataFusionError::Internal(format!(
+                        "Unexpected partitioning in SortShuffleWriterExec: {other:?}"
+                    )));
+                }
             };
 
             // Create partition buffers
@@ -227,26 +237,32 @@ impl SortShuffleWriterExec {
             )
             .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
-            // Create batch partitioner
-            let mut partitioner = BatchPartitioner::new_hash_partitioner(
-                exprs,
-                num_output_partitions,
-                metrics.repart_time.clone(),
-            );
+            // Create batch partitioner only when actually re-partitioning by hash.
+            let mut partitioner = match &partitioning {
+                Some(Partitioning::Hash(exprs, n)) => Some(
+                    BatchPartitioner::new_hash_partitioner(
+                        exprs.clone(),
+                        *n,
+                        metrics.repart_time.clone(),
+                    ),
+                ),
+                _ => None,
+            };
 
             // Process input stream
             while let Some(result) = stream.next().await {
                 let input_batch = result?;
                 metrics.input_rows.add(input_batch.num_rows());
 
-                // Partition the batch
-                partitioner.partition(
-                    input_batch,
-                    |output_partition, output_batch| {
+                if let Some(p) = partitioner.as_mut() {
+                    p.partition(input_batch, |output_partition, output_batch| {
                         buffers[output_partition].append(output_batch);
                         Ok(())
-                    },
-                )?;
+                    })?;
+                } else {
+                    // No partitioning: route everything to bucket 0.
+                    buffers[0].append(input_batch);
+                }
 
                 // Check if we need to spill
                 let total_memory: usize = buffers.iter().map(|b| b.memory_used()).sum();
@@ -468,16 +484,17 @@ impl DisplayAs for SortShuffleWriterExec {
         t: DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
+        let partitioning = self
+            .shuffle_output_partitioning
+            .as_ref()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "None".to_string());
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "SortShuffleWriterExec: partitioning={}",
-                    self.shuffle_output_partitioning
-                )
+                write!(f, "SortShuffleWriterExec: partitioning={partitioning}")
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "partitioning={}", self.shuffle_output_partitioning)
+                write!(f, "partitioning={partitioning}")
             }
         }
     }
@@ -627,7 +644,7 @@ impl ShuffleWriter for SortShuffleWriterExec {
     }
 
     fn shuffle_output_partitioning(&self) -> Option<&Partitioning> {
-        Some(&self.shuffle_output_partitioning)
+        self.shuffle_output_partitioning.as_ref()
     }
 
     fn input_partition_count(&self) -> usize {
@@ -716,7 +733,7 @@ mod tests {
             1,
             input_plan,
             work_dir.path().to_str().unwrap().to_string(),
-            Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 2),
+            Some(Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 2)),
             config,
         )?;
 
@@ -736,6 +753,63 @@ mod tests {
         assert!(output_dir.join("data.arrow").exists());
         assert!(output_dir.join("data.arrow.index").exists());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_shuffle_with_no_partitioning() -> Result<()> {
+        use crate::execution_plans::sort_shuffle::reader::read_sort_shuffle_partition;
+
+        let session_ctx = SessionContext::new();
+        let task_ctx = session_ctx.task_ctx();
+
+        let work_dir = TempDir::new()?;
+        let work_dir_str = work_dir.path().to_str().unwrap().to_string();
+
+        let input = create_test_input()?;
+        // create_test_input(): 2 input partitions × 2 batches × 2 rows = 8 rows total
+        let num_input_partitions =
+            input.properties().output_partitioning().partition_count();
+
+        let writer = SortShuffleWriterExec::try_new(
+            "job-none".to_string(),
+            1,
+            input,
+            work_dir_str.clone(),
+            None,
+            SortShuffleConfig::default(),
+        )?;
+
+        let mut total_rows = 0u64;
+        for input_partition in 0..num_input_partitions {
+            let results = writer
+                .clone()
+                .execute_shuffle_write(input_partition, task_ctx.clone())
+                .await?;
+
+            // Exactly one output partition (partition 0) per input partition
+            assert_eq!(results.len(), 1, "expected 1 output partition");
+            assert_eq!(results[0].partition_id, 0);
+            assert!(results[0].is_sort_shuffle);
+            total_rows += results[0].num_rows;
+
+            // Verify the data file is readable via the sort-shuffle reader
+            let data_path = work_dir
+                .path()
+                .join("job-none")
+                .join("1")
+                .join(format!("{input_partition}"))
+                .join("data.arrow");
+            let index_path = data_path.with_extension("arrow.index");
+            assert!(data_path.exists(), "data file missing");
+            assert!(index_path.exists(), "index file missing");
+
+            let batches = read_sort_shuffle_partition(&data_path, &index_path, 0)
+                .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+            let read_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(read_rows as u64, results[0].num_rows);
+        }
+        assert_eq!(total_rows, 8); // 2 partitions × 2 batches × 2 rows
         Ok(())
     }
 }
