@@ -873,7 +873,10 @@ order by
         assert!(stages.len() >= 2, "expected at least 2 stages");
         for (i, stage) in stages.iter().enumerate() {
             assert!(
-                stage.as_any().downcast_ref::<SortShuffleWriterExec>().is_some(),
+                stage
+                    .as_any()
+                    .downcast_ref::<SortShuffleWriterExec>()
+                    .is_some(),
                 "stage {i} expected SortShuffleWriterExec, got {}",
                 stage.name()
             );

@@ -235,10 +235,10 @@ async fn benchmark_sort_shuffle(
         1,
         input,
         work_dir.to_owned(),
-        Partitioning::Hash(
+        Some(Partitioning::Hash(
             vec![Arc::new(Column::new("partition_key", 1))],
             output_partitions,
-        ),
+        )),
         config,
     )?;
 
