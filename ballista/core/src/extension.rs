@@ -1065,7 +1065,7 @@ mod test {
                 .options()
                 .optimizer
                 .hash_join_single_partition_threshold,
-            0
+            10 * 1024 * 1024
         );
     }
 
