@@ -83,6 +83,18 @@ impl BallistaClient {
                 ))
             })?;
 
+        // Enable HTTP/2 keepalive on shuffle-fetch connections. Previously these
+        // endpoints were created with no keepalive (the `None` config above), so a
+        // connection that went stale while idle in the client pool was never
+        // health-checked and could be handed out and then die mid-fetch. With
+        // keepalive PINGs (including while idle) a dead connection is detected and
+        // replaced before reuse instead of failing a shuffle read.
+        endpoint = endpoint
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .keep_alive_timeout(std::time::Duration::from_secs(20))
+            .keep_alive_while_idle(true);
+
         if let Some(customize) = customize_endpoint {
             endpoint = customize
                 .configure_endpoint(endpoint)
