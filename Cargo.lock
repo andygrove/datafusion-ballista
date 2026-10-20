@@ -1103,7 +1103,7 @@ dependencies = [
  "ratatui",
  "ratzilla",
  "reqwest 0.13.5",
- "rustyline",
+ "rustyline 19.0.0",
  "serde",
  "serde_json",
  "tokio",
@@ -2383,7 +2383,7 @@ dependencies = [
  "parking_lot",
  "parquet",
  "regex",
- "rustyline",
+ "rustyline 18.0.1",
  "tokio",
  "url",
 ]
@@ -6319,6 +6319,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyline"
+version = "19.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56e1d6bd81c2d5feafd2419138df9183c45a10a492c4e873b8b0acb8eb2b549e"
+dependencies = [
+ "bitflags 2.13.1",
+ "clipboard-win",
+ "home",
+ "libc",
+ "log",
+ "memchr",
+ "nix 0.31.3",
+ "radix_trie",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+ "utf8parse",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6992,7 +7012,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
