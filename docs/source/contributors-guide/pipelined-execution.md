@@ -316,13 +316,17 @@ land and keep [Current status](#current-status) in step.
    hosts (`productionresultssa*.blob.core.windows.net`) on the sandbox
    allowlist.
 
-2. **More end-to-end coverage.**
-   - Cancelling a running pipelined job releases its vcores and its
-     registry entries.
-3. **M6: benchmarks and tuning.** The TPC-H SF10 workflow prints each
-   query's time for every leg, so its `pipelined` leg against `AQE off` is a
-   first comparison. Add tuning notes for `ballista.pipelined.queue_capacity`
-   to the user guide page once there are numbers.
+2. **Cancellation.** Scheduler tests cover a cancelled job releasing its
+   vcores and a waiting job being placed after it. The client's
+   cancel-on-drop is exercised end to end by
+   `dropping_the_results_early_frees_the_cluster`. Nothing yet cancels a
+   running job through the scheduler API end to end and checks that its
+   registry entries are gone.
+3. **M6: benchmarks and tuning.** The first numbers above oversubscribe every
+   stage fourfold on a single executor. A fair comparison runs pipelined
+   with as many partitions as the cluster has vcores, on more than one
+   executor. Then add tuning notes for `ballista.pipelined.queue_capacity`
+   and executor memory to the user guide page.
 
 ## Design decisions
 
