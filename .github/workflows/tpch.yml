@@ -50,6 +50,11 @@ jobs:
           - label: "AQE on, multi-partition tasks"
             planner_args: "-c ballista.planner.adaptive.enabled=true -c ballista.scheduler.max_partitions_per_task=0"
             slug: "aqe-on-mpt"
+          # The cluster runs push-staged (the binaries' default), which
+          # pipelined execution requires.
+          - label: "pipelined"
+            planner_args: "-c ballista.execution.mode=pipelined"
+            slug: "pipelined"
     steps:
       - uses: actions/checkout@v7.0.1
         with:

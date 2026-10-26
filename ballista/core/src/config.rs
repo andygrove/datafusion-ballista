@@ -533,9 +533,11 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
             "How a job's stages exchange data. `blocking` runs stages one after \
              another and passes data between them through shuffle files. \
              `pipelined` (experimental) places every task of the job up front \
-             and streams record batches between stages over Arrow Flight, for \
-             lower latency at the cost of task retries and of running queries \
-             wider than the cluster. `pipelined` requires push-staged scheduling."
+             and streams record batches between stages over Arrow Flight. It \
+             has lower latency, but a failed task fails the job instead of \
+             being retried, and a job waits until it can reserve the vcores \
+             of its widest stage all at once. `pipelined` requires push-staged \
+             scheduling."
                 .to_string(),
             DataType::Utf8,
             Some(ExecutionMode::Blocking.to_string()),

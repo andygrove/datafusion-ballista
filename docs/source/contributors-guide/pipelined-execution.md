@@ -79,7 +79,9 @@ land and keep [Current status](#current-status) in step.
         failing query, remote reads, and pull-staged rejection.
   - [ ] The end-to-end tests pass in CI.
   - [x] A multi-executor cluster, and a client that stops reading early.
-  - [ ] TPC-H correctness and cancellation.
+  - [x] TPC-H SF10 in CI: a `pipelined` leg in `.github/workflows/tpch.yml`.
+  - [ ] The TPC-H leg passes.
+  - [ ] Cancellation.
 - [ ] **M6: Docs and polish.** User guide page, tuning notes, benchmarks
       against blocking mode, and removal of the tracking sections.
 
@@ -207,6 +209,11 @@ land and keep [Current status](#current-status) in step.
     four-partition plans fit whatever the machine's core count. They bind
     sockets, so they have only run in CI.
 
+  - **TPC-H.** `.github/workflows/tpch.yml` gains a `pipelined` matrix leg.
+    It runs every query but q16 on SF10 with `--verify` against DataFusion,
+    on the workflow's one-executor cluster. That cluster runs push-staged,
+    the binaries' default. Its executor has 4 vcores and queries use 16
+    partitions, so every stage is wider than the cluster and shares vcores.
   - **Unclaimed queues time out.** A producer waits on a full queue that no
     consumer has opened only for `ballista.pipelined.registration_timeout_seconds`,
     then fails its task, which fails the job. Before, a client that
@@ -215,12 +222,13 @@ land and keep [Current status](#current-status) in step.
 
 ## Next steps
 
-1. **Get the end-to-end tests passing in CI.** Check the "test linux
-   ballista" job on [#2657] (`gh pr checks 2657 -R apache/datafusion-ballista`)
-   and fix whatever `ballista/client/tests/pipelined.rs` turns up.
+1. **Get the end-to-end tests passing in CI.** On [#2657]
+   (`gh pr checks 2657 -R apache/datafusion-ballista`), check:
+   - the "test linux ballista" job, which runs
+     `ballista/client/tests/pipelined.rs`;
+   - the "TPC-H SF10 (pipelined)" job. It uploads the cluster logs when it
+     fails.
 2. **More end-to-end coverage.**
-   - TPC-H correctness against blocking mode, for example with the
-     benchmark crate's TPC-H queries on generated data.
    - Cancelling a running pipelined job releases its vcores and its
      registry entries.
    - The client does not cancel a job when its result stream is dropped.
