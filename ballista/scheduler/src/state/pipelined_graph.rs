@@ -32,8 +32,11 @@
 //!   to the producer tasks it streams from.
 //! - The job reserves, on each executor, the most vcores any one of its
 //!   stages uses there rather than the sum, since its stages share CPU and a
-//!   task waiting on another is a parked future, not a thread. The
-//!   reservation is released when the job finishes, not task by task.
+//!   task waiting on another is a parked future, not a thread. For the same
+//!   reason a stage wider than the cluster, such as a `UNION ALL` of several
+//!   scans, can run several partitions per vcore: it waits for every vcore
+//!   to be free instead of failing. The reservation is released when the job
+//!   finishes, not task by task.
 //! - Nothing is retried. A failed task or a lost executor fails the job.
 //!   When the final stage completes, tasks still running — producers whose
 //!   consumer stopped early, as under a `LIMIT` — are cancelled.
@@ -99,10 +102,8 @@ pub struct Placement {
 pub enum PlacementDecision {
     /// The job fits in the free vcores now.
     Fits(Placement),
-    /// The job does not fit now, but could once vcores free up.
+    /// The job does not fit now, but will once vcores free up.
     Wait,
-    /// The job can never fit in the cluster as it is.
-    NeverFits(String),
 }
 
 /// Decides where every task of a pipelined job runs, given each executor's
@@ -117,26 +118,14 @@ pub enum PlacementDecision {
 /// unbounded).
 ///
 /// `total_vcores` is the cluster's capacity when idle. A stage wider than
-/// that can never be placed.
+/// that needs every vcore free, and then shares them: its partitions are
+/// dealt round-robin again once each free vcore has one.
 pub fn plan_placement(
     requirements: &[StageRequirement],
     available: &[AvailableVcores],
     total_vcores: usize,
     max_partitions_per_task: usize,
 ) -> PlacementDecision {
-    if let Some(widest) = requirements
-        .iter()
-        .filter(|r| !r.collapse)
-        .map(|r| r.partitions)
-        .max()
-        && widest > total_vcores
-    {
-        return PlacementDecision::NeverFits(format!(
-            "its widest stage has {widest} partitions, each needing a vcore at the \
-             same time, but the cluster has {total_vcores} vcores"
-        ));
-    }
-
     // Most free first, then by id, so placement is deterministic.
     let mut budgets: Vec<(&str, usize)> = available
         .iter()
@@ -164,11 +153,12 @@ pub fn plan_placement(
             let entry = reserved.entry(executor).or_default();
             *entry = (*entry).max(1);
         } else {
-            let Some(counts) = spread(requirement.partitions, &budgets) else {
+            let Some(counts) = spread(requirement.partitions, &budgets, total_vcores)
+            else {
                 return PlacementDecision::Wait;
             };
             let mut next = 0;
-            for ((executor, _), count) in budgets.iter().zip(counts) {
+            for ((executor, free), count) in budgets.iter().zip(counts) {
                 if count == 0 {
                     continue;
                 }
@@ -178,7 +168,7 @@ pub fn plan_placement(
                     stage_tasks.push(((*executor).to_owned(), chunk.to_vec()));
                 }
                 let entry = reserved.entry(executor).or_default();
-                *entry = (*entry).max(count);
+                *entry = (*entry).max(count.min(*free));
             }
         }
         tasks.insert(requirement.stage_id, stage_tasks);
@@ -193,24 +183,40 @@ pub fn plan_placement(
 }
 
 /// Deals `partitions` one at a time, round-robin, to the executors that still
-/// have a free vcore. Returns how many each executor got, or `None` if they
-/// do not have enough free vcores between them.
-fn spread(partitions: usize, budgets: &[(&str, usize)]) -> Option<Vec<usize>> {
-    if budgets.iter().map(|(_, free)| free).sum::<usize>() < partitions {
+/// have a free vcore, and deals what is left the same way once every free
+/// vcore has a partition. Returns how many each executor got, or `None` if
+/// fewer vcores are free than the stage needs: one per partition, but no more
+/// than the cluster's `total_vcores`.
+fn spread(
+    partitions: usize,
+    budgets: &[(&str, usize)],
+    total_vcores: usize,
+) -> Option<Vec<usize>> {
+    let free: usize = budgets.iter().map(|(_, free)| free).sum();
+    if free < partitions.min(total_vcores) || free == 0 {
         return None;
     }
     let mut counts = vec![0; budgets.len()];
-    let mut dealt = 0;
-    while dealt < partitions {
-        for (i, (_, free)) in budgets.iter().enumerate() {
-            if dealt == partitions {
-                break;
-            }
-            if counts[i] < *free {
-                counts[i] += 1;
-                dealt += 1;
+    let mut left = partitions;
+    while left > 0 {
+        let round = left.min(free);
+        let mut dealt = vec![0; budgets.len()];
+        let mut total = 0;
+        while total < round {
+            for (i, (_, free)) in budgets.iter().enumerate() {
+                if total == round {
+                    break;
+                }
+                if dealt[i] < *free {
+                    dealt[i] += 1;
+                    total += 1;
+                }
             }
         }
+        for (count, dealt) in counts.iter_mut().zip(dealt) {
+            *count += dealt;
+        }
+        left -= round;
     }
     Some(counts)
 }
@@ -1047,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_waits_for_free_vcores_and_rejects_jobs_wider_than_the_cluster() {
+    fn placement_waits_for_free_vcores() {
         assert_eq!(
             plan_placement(
                 &[requirement(1, 4, false)],
@@ -1061,15 +1067,51 @@ mod tests {
             plan_placement(&[requirement(1, 4, false)], &[], 8, 0),
             PlacementDecision::Wait
         );
-        assert!(matches!(
+        // A stage wider than the cluster waits until every vcore is free.
+        assert_eq!(
             plan_placement(
                 &[requirement(1, 9, false)],
-                &available(&[("a", 4), ("b", 4)]),
+                &available(&[("a", 4), ("b", 3)]),
                 8,
                 0
             ),
-            PlacementDecision::NeverFits(_)
+            PlacementDecision::Wait
+        );
+    }
+
+    #[test]
+    fn stage_wider_than_the_cluster_shares_its_vcores() {
+        let placement = fits(plan_placement(
+            &[requirement(1, 9, false), requirement(2, 2, false)],
+            &available(&[("a", 4), ("b", 4)]),
+            8,
+            0,
         ));
+        assert_eq!(
+            placement.tasks[&1],
+            vec![
+                ("a".to_owned(), vec![0, 1, 2, 3, 4]),
+                ("b".to_owned(), vec![5, 6, 7, 8])
+            ]
+        );
+        assert_eq!(
+            placement.tasks[&2],
+            vec![("a".to_owned(), vec![0]), ("b".to_owned(), vec![1])]
+        );
+        // No executor reserves more than it has.
+        assert_eq!(
+            placement.reservation,
+            vec![("a".to_owned(), 4), ("b".to_owned(), 4)]
+        );
+    }
+
+    #[test]
+    fn wide_stage_spreads_in_proportion_to_free_vcores() {
+        assert_eq!(spread(9, &[("a", 3), ("b", 1)], 4), Some(vec![7, 2]));
+        assert_eq!(spread(4, &[("a", 3), ("b", 1)], 4), Some(vec![3, 1]));
+        assert_eq!(spread(2, &[("a", 3), ("b", 1)], 4), Some(vec![1, 1]));
+        assert_eq!(spread(5, &[("a", 3), ("b", 1)], 8), None);
+        assert_eq!(spread(1, &[], 0), None);
     }
 
     async fn pipelined_join_graph() -> PipelinedExecutionGraph {
@@ -1417,14 +1459,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipelined_job_wider_than_the_cluster_fails() -> Result<()> {
+    async fn pipelined_job_wider_than_the_cluster_shares_its_vcores() -> Result<()> {
         let mut test = pipelined_scheduler(TaskSchedulingPolicy::PushStaged, None).await;
         test.set_session_option("datafusion.execution.target_partitions", "64")?;
         let (status, _) = test.run("pipelined", &aggregation(64)).await?;
-        let Some(Status::Failed(failed)) = status.status else {
-            panic!("expected the job to fail, got {status:?}");
-        };
-        assert!(failed.error.contains("vcores"), "{}", failed.error);
+        assert!(
+            matches!(status.status, Some(Status::Successful(_))),
+            "{status:?}"
+        );
+        let released = await_condition(Duration::from_millis(20), 100, || async {
+            Ok(test.free_vcores().await? == 8)
+        })
+        .await?;
+        assert!(released, "the job's vcores were not released");
         Ok(())
     }
 

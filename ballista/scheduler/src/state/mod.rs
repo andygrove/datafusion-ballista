@@ -261,8 +261,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
     /// The placement is planned under the job's read lock, the vcores are
     /// reserved all at once, and the placement is committed under the job's
     /// write lock, so the job lock and the vcore lock are never held
-    /// together. A job that does not fit yet waits for a later round; one
-    /// wider than the whole cluster fails.
+    /// together. A job that does not fit yet waits for a later round.
     async fn bind_pipelined_jobs(
         &self,
         sender: &EventSender<QueryStageSchedulerEvent>,
@@ -303,18 +302,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             ) {
                 PlacementDecision::Wait => {
                     debug!("Pipelined job {job_id} does not fit in the free vcores yet");
-                }
-                PlacementDecision::NeverFits(reason) => {
-                    sender
-                        .post_event(QueryStageSchedulerEvent::JobRunningFailed {
-                            job_id: job_id.clone(),
-                            fail_message: format!(
-                                "Pipelined job {job_id} cannot run, because {reason}"
-                            ),
-                            queued_at,
-                            failed_at: timestamp_millis(),
-                        })
-                        .await?;
                 }
                 PlacementDecision::Fits(placement) => {
                     if !self

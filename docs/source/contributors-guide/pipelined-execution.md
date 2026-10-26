@@ -120,8 +120,10 @@ land and keep [Current status](#current-status) in step.
     - A collapse stage gets one task and one vcore.
     - The reservation on each executor is the largest number of vcores any
       single stage uses there.
-    - The result is `Wait` if the job does not fit yet, and `NeverFits` if the
-      widest stage exceeds the cluster's total vcores.
+    - The result is `Wait` if the job does not fit yet.
+    - A stage wider than the cluster's total vcores, such as a `UNION ALL`
+      of several scans, waits until every vcore is free and then runs
+      several partitions per vcore. It used to fail the job.
   - **Binding.** `SchedulerState::bind_pipelined_jobs` runs before the normal
     binders in `revive_offers`.
     - It plans under the graph's read lock, reserves through the new
@@ -151,7 +153,7 @@ land and keep [Current status](#current-status) in step.
   sockets) cover:
   - all stages launching before any task finishes;
   - success, task failure and cancellation, each releasing every vcore;
-  - a job wider than the cluster failing;
+  - a job wider than the cluster running with several partitions per vcore;
   - a lost executor failing the job;
   - pull-staged rejection.
 - **M4 done.** The client is in
@@ -202,11 +204,18 @@ land and keep [Current status](#current-status) in step.
      registry entries.
    - A multi-executor cluster, so exchanges really cross executors (two
      standalone executors, or the `testcontainers` cluster tests).
-3. **Flight SQL.** `ballista/scheduler/src/flight_sql.rs` only reads
+3. **Memory pools.** With `--memory-pool-size` set, each task's pool is
+   `per_vcore × vcores_consumed`, which assumes the tasks running on an
+   executor never claim more than its vcores between them. A pipelined
+   job's stages all run at once on one reservation, and a wide stage packs
+   several partitions per vcore, so their pools add up to more than the
+   executor's memory. Pools for a pipelined job should come from its
+   reservation, shared among all its tasks on the executor.
+4. **Flight SQL.** `ballista/scheduler/src/flight_sql.rs` only reads
    `SuccessfulJob.partition_location`, which is empty for a pipelined job.
    It needs to stream `pipelined_output_locations` while the job runs, as
    `DistributedQueryExec` now does.
-4. **M6: docs and polish.** A user guide page, tuning notes for
+5. **M6: docs and polish.** A user guide page, tuning notes for
    `ballista.pipelined.queue_capacity`, and benchmarks against blocking mode.
 
 ## Design decisions
@@ -255,6 +264,11 @@ relitigated. The design issue [#2652] records the overall architecture.
 - **The registry remembers finished jobs.** It keeps the last 1024 cleaned-up
   job ids. A producer task that starts after its job was cleaned up fails
   instead of waiting forever for consumers that are gone.
+- **A stage wider than the cluster shares vcores rather than failing.** The
+  reservation is already a soft budget: stages share it, and a waiting task
+  is a parked future, not a thread. A `UNION ALL` is as wide as all its
+  inputs together, so refusing such stages would fail ordinary queries. The
+  cost is that a wide job waits for the whole cluster to be free.
 - **The reservation is held for the whole job.** A pipelined job's vcores are
   reserved once, at placement, and released once, when it ends. Releasing per
   task would hand vcores back while other tasks of the job still run on the
