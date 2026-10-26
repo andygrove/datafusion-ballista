@@ -59,15 +59,15 @@ land and keep [Current status](#current-status) in step.
 - [x] **M2: Executor wiring.** Inject the registry into the execution engine
       and the Flight service, serve `FetchPipelinedPartition`, and clean up on
       `RemoveJobData`.
-- [ ] **M3: Scheduler.**
-  - [ ] `PipelinedExecutionGraph` built from `DefaultDistributedPlanner`.
-  - [ ] All-or-nothing placement in the push-staged bind pass, with
+- [x] **M3: Scheduler.**
+  - [x] `PipelinedExecutionGraph` built from `DefaultDistributedPlanner`.
+  - [x] All-or-nothing placement in the push-staged bind pass, with
         per-executor reservations (the largest stage's vcores, not the sum).
-  - [ ] Resolve readers to producer locations at placement time.
-  - [ ] Publish the final stage's locations in the `Running` status.
-  - [ ] Fail the job on any task failure or lost executor, and cancel
+  - [x] Resolve readers to producer locations at placement time.
+  - [x] Publish the final stage's locations in the `Running` status.
+  - [x] Fail the job on any task failure or lost executor, and cancel
         leftover tasks when the final stage completes.
-  - [ ] Reject pipelined jobs under pull-staged scheduling.
+  - [x] Reject pipelined jobs under pull-staged scheduling.
 - [ ] **M4: Client.** `DistributedQueryExec` reads the final stage while the
       job is running, reads all partitions concurrently, and surfaces a job
       failure from the status stream.
@@ -104,32 +104,78 @@ land and keep [Current status](#current-status) in step.
     standalone executors wire it up.
   - `RemoveJobData` and pull-mode `jobs_to_clean` drop the job's registry
     entries.
-- Nothing creates pipelined plans yet, so the setting still has no effect.
-  That is M3.
+- **M3 done.** The scheduler is in `ballista/scheduler/src/state/pipelined_graph.rs`.
+  - **`PipelinedExecutionGraph`.** It plans the job with the static planner
+    and swaps each stage root for a `PipelinedShuffleWriterExec`. A stage read
+    through a broadcast reader is marked `broadcast`.
+  - **Graph selection.** `TaskManager::submit_plan` picks this graph when
+    `ballista.execution.mode = pipelined`, ignoring the AQE setting.
+  - **Placement.** `plan_placement` is a pure function that spreads each
+    stage's partitions round-robin over executors with free vcores, using
+    contiguous ranges and capping tasks at `max_partitions_per_task`.
+    - A collapse stage gets one task and one vcore.
+    - The reservation on each executor is the largest number of vcores any
+      single stage uses there.
+    - The result is `Wait` if the job does not fit yet, and `NeverFits` if the
+      widest stage exceeds the cluster's total vcores.
+  - **Binding.** `SchedulerState::bind_pipelined_jobs` runs before the normal
+    binders in `revive_offers`.
+    - It plans under the graph's read lock, reserves through the new
+      `ClusterState::reserve_vcores` (all or nothing), and commits with
+      `PipelinedExecutionGraph::place`, so the graph and vcore locks are never
+      held together.
+    - `place` resolves every `UnresolvedShuffleExec` to a
+      `PipelinedShuffleReaderExec` and marks all stages running.
+    - It also sets `RunningJob.pipelined_output_locations` and posts
+      `JobUpdated`, which pushes the locations to the client.
+  - **Releasing the reservation.** It is released once, when the job ends.
+    `TaskManager::succeed_job` returns it and the `JobFinished` handler
+    releases it; `abort_job` releases it on failure or cancellation. Every
+    task's own `vcores_consumed` is 0 in scheduler bookkeeping.
+  - **Failure.** A failed task fails the job (`JobRunningFailed`), and there
+    are no retries. `TaskManager::executor_lost` reports pipelined jobs that
+    used the lost executor; the handler then fails them.
+  - **Completion.** When the final stage completes, every stage becomes
+    `Successful`, the leftover running tasks are cancelled with `CancelTasks`,
+    and `JobFinished` is posted.
+  - **Pull-staged scheduling.** `SchedulerState::submit_job` rejects
+    pipelined jobs under pull-staged.
+  - **Per-task restriction.** `task_builder` restricts
+    `PipelinedShuffleReaderExec` to each task's slice and leaves broadcast
+    readers whole.
+- **Tests.** Scheduler-level tests (`SchedulerTest`, virtual executors, no
+  sockets) cover:
+  - all stages launching before any task finishes;
+  - success, task failure and cancellation, each releasing every vcore;
+  - a job wider than the cluster failing;
+  - a lost executor failing the job;
+  - pull-staged rejection.
+- **Not yet end to end.** The client still waits for `SuccessfulJob` before
+  fetching, but a pipelined job's final stage cannot finish until its
+  consumer drains it. So a real pipelined query hangs until M4.
 
 ## Next steps
 
-1. **M3: `PipelinedExecutionGraph`** in
-   `ballista/scheduler/src/state/pipelined_graph.rs`.
-   - Plan the stages with `DefaultDistributedPlanner`.
-   - Swap each stage root for a `PipelinedShuffleWriterExec`: a hash
-     `SortShuffleWriterExec` becomes hash, a `ShuffleWriterExec` becomes
-     passthrough, and a stage read through a broadcast `UnresolvedShuffleExec`
-     sets `broadcast`.
-   - Select the graph in `TaskManager::submit_plan` when
-     `ballista_config().execution_mode()` is `Pipelined`.
-2. **M3: all-or-nothing placement.** Add a pre-pass in
-   `InMemoryClusterState::bind_schedulable_tasks`, before the distribution
-   policy runs, that places every task of a pipelined job at once.
-   - Resolve each consumer's `UnresolvedShuffleExec` to a
-     `PipelinedShuffleReaderExec` from the placement.
-   - Teach `task_builder::restrict_plan_to_partitions` about the new reader;
-     `PipelinedShuffleReaderExec::with_partitions` is ready for it.
-3. **M3: status, failure and pull-staged handling.**
-   - Push the final stage's locations in `RunningJob`.
-   - Fail the job on any task failure or lost executor.
-   - Cancel leftover tasks once the final stage succeeds.
-   - Reject the job under pull-staged scheduling.
+1. **M4: client.** In `ballista/core/src/execution_plans/distributed_query.rs`,
+   change `execute_query_push`, and `execute_query_pull` if needed, to act
+   on a `Running` status whose `pipelined_output_locations` is non-empty:
+   - Stream every location concurrently through
+     `BallistaClient::fetch_pipelined_partition`, merged with `select_all`.
+     Reuse the scheduler or external flight proxy when one is configured;
+     `ForwardingBackend` already forwards the new action.
+   - Keep watching the status stream, and end the result stream with an
+     error if the job fails.
+   - Ignore the later `SuccessfulJob`, whose `partition_location` is empty.
+2. **M5: push-staged standalone.**
+   - Add a standalone scheduler and executor pair that runs push-staged, with
+     the executor gRPC server on a random port.
+   - Use it from `SessionContext::standalone()` when the session asks for
+     pipelined mode, or from a test helper in `ballista/client/tests/common`.
+3. **M5: end-to-end tests in `ballista/client/tests`.** These are
+   socket-based, so they run in CI only:
+   - TPC-H-style joins and aggregates;
+   - broadcast joins, unions and `ORDER BY`;
+   - `LIMIT`, cancellation, and a failing UDF.
 
 ## Design decisions
 
@@ -177,6 +223,17 @@ relitigated. The design issue [#2652] records the overall architecture.
 - **The registry remembers finished jobs.** It keeps the last 1024 cleaned-up
   job ids. A producer task that starts after its job was cleaned up fails
   instead of waiting forever for consumers that are gone.
+- **The reservation is held for the whole job.** A pipelined job's vcores are
+  reserved once, at placement, and released once, when it ends. Releasing per
+  task would hand vcores back while other tasks of the job still run on the
+  same executor. The job's task infos carry `vcores_consumed = 0`, so the
+  normal per-task refunds stay correct. The `TaskDescription` sent to the
+  executor still carries the slice length, which sizes the task's memory
+  pool.
+- **Placement and reservation never hold two locks.** The placement is planned
+  under the graph read lock, the vcores are reserved atomically, and the
+  placement is committed under the graph write lock. That avoids the
+  vcore-lock-then-graph-lock order that `bind_schedulable_tasks` uses.
 - **The fetch responds before the producer exists.** The Flight `do_get` for a
   pipelined partition returns its response at once and waits for the producer
   inside the stream body. A consumer that arrives early is therefore not cut

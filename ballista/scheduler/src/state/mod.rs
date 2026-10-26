@@ -21,12 +21,15 @@ use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
 use crate::scheduler_server::timestamp_millis;
 use crate::state::execution_graph::TaskDescription;
 use crate::state::executor_manager::ExecutorManager;
+use crate::state::pipelined_graph::{PlacementDecision, plan_placement};
 use crate::state::session_manager::SessionManager;
 use crate::state::task_manager::{TaskLauncher, TaskManager};
+use ballista_core::config::ExecutionMode;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::event_loop::EventSender;
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::BallistaCodec;
-use ballista_core::serde::protobuf::TaskStatus;
+use ballista_core::serde::protobuf::{TaskStatus, job_status};
 use ballista_core::{JobId, JobStatusSubscriber};
 use datafusion::execution::context::SessionContext;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -50,6 +53,8 @@ pub mod execution_graph_dot;
 pub mod execution_stage;
 /// Executor registration and management.
 pub mod executor_manager;
+/// Execution graph of a pipelined job, whose tasks all run at once.
+pub mod pipelined_graph;
 /// Session state management.
 pub mod session_manager;
 /// Per-task plan rewriter (restrict scan/shuffle-reader to task's slice).
@@ -189,10 +194,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         &self,
         sender: EventSender<QueryStageSchedulerEvent>,
     ) -> Result<()> {
-        let schedulable_tasks = self
-            .executor_manager
-            .bind_schedulable_tasks(self.task_manager.get_running_job_cache())
-            .await?;
+        // Pipelined jobs go first: each needs all of its vcores at once, and
+        // stage-by-stage binding would otherwise take them piecemeal.
+        let mut schedulable_tasks = self.bind_pipelined_jobs(&sender).await?;
+        schedulable_tasks.extend(
+            self.executor_manager
+                .bind_schedulable_tasks(self.task_manager.get_running_job_cache())
+                .await?,
+        );
         if schedulable_tasks.is_empty() {
             debug!("No schedulable tasks found to be launched");
             return Ok(());
@@ -244,6 +253,123 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         });
 
         Ok(())
+    }
+
+    /// Places every task of each running pipelined job that fits in the free
+    /// vcores, returning the tasks to launch.
+    ///
+    /// The placement is planned under the job's read lock, the vcores are
+    /// reserved all at once, and the placement is committed under the job's
+    /// write lock, so the job lock and the vcore lock are never held
+    /// together. A job that does not fit yet waits for a later round; one
+    /// wider than the whole cluster fails.
+    async fn bind_pipelined_jobs(
+        &self,
+        sender: &EventSender<QueryStageSchedulerEvent>,
+    ) -> Result<Vec<BoundTask>> {
+        let running_jobs = self.task_manager.get_running_job_cache();
+        let mut bound = vec![];
+        let mut candidates = None;
+        for (job_id, job_info) in running_jobs.iter() {
+            let Some(job_status::Status::Running(running)) = &job_info.status else {
+                continue;
+            };
+            let queued_at = running.queued_at;
+            let (requirements, max_partitions_per_task) = {
+                let graph = job_info.execution_graph.read().await;
+                let Some(pipelined) = graph.as_pipelined() else {
+                    continue;
+                };
+                let Some(requirements) = pipelined.placement_requirements() else {
+                    continue;
+                };
+                (requirements, pipelined.max_partitions_per_task())
+            };
+            if candidates.is_none() {
+                candidates = Some(self.executor_manager.placement_candidates().await?);
+            }
+            let Some((executors, available)) = &candidates else {
+                continue;
+            };
+            let total_vcores = executors
+                .values()
+                .map(|metadata| metadata.specification.vcores as usize)
+                .sum();
+            match plan_placement(
+                &requirements,
+                available,
+                total_vcores,
+                max_partitions_per_task,
+            ) {
+                PlacementDecision::Wait => {
+                    debug!("Pipelined job {job_id} does not fit in the free vcores yet");
+                }
+                PlacementDecision::NeverFits(reason) => {
+                    sender
+                        .post_event(QueryStageSchedulerEvent::JobRunningFailed {
+                            job_id: job_id.clone(),
+                            fail_message: format!(
+                                "Pipelined job {job_id} cannot run, because {reason}"
+                            ),
+                            queued_at,
+                            failed_at: timestamp_millis(),
+                        })
+                        .await?;
+                }
+                PlacementDecision::Fits(placement) => {
+                    if !self
+                        .executor_manager
+                        .reserve_vcores(&placement.reservation)
+                        .await?
+                    {
+                        debug!(
+                            "Free vcores changed while placing pipelined job {job_id}"
+                        );
+                        candidates = None;
+                        continue;
+                    }
+                    // Free vcores are lower now; look again for the next job.
+                    let Some((executors, _)) = candidates.take() else {
+                        continue;
+                    };
+                    let placed = {
+                        let mut graph = job_info.execution_graph.write().await;
+                        match graph.as_pipelined_mut() {
+                            Some(pipelined) => pipelined.place(&placement, &executors),
+                            None => Ok(vec![]),
+                        }
+                    };
+                    match placed {
+                        Ok(tasks) => {
+                            bound.extend(tasks);
+                            // Publishes the final stage's locations to the
+                            // client, which reads them while the job runs.
+                            sender
+                                .post_event(QueryStageSchedulerEvent::JobUpdated(
+                                    job_id.clone(),
+                                ))
+                                .await?;
+                        }
+                        Err(e) => {
+                            self.executor_manager
+                                .unbind_tasks(placement.reservation)
+                                .await?;
+                            sender
+                                .post_event(QueryStageSchedulerEvent::JobRunningFailed {
+                                    job_id: job_id.clone(),
+                                    fail_message: format!(
+                                        "Failed to place pipelined job {job_id}: {e}"
+                                    ),
+                                    queued_at,
+                                    failed_at: timestamp_millis(),
+                                })
+                                .await?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(bound)
     }
 
     /// Remove an executor.
@@ -421,6 +547,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()> {
         let start = Instant::now();
+
+        // A pipelined job must be placed all at once, which the scheduler can
+        // only do when it pushes tasks to executors.
+        if !self.config.is_push_staged_scheduling()
+            && session_ctx
+                .state()
+                .config()
+                .ballista_config()
+                .execution_mode()?
+                == ExecutionMode::Pipelined
+        {
+            return Err(BallistaError::General(
+                "ballista.execution.mode = pipelined requires push-staged scheduling, \
+                 but this scheduler runs pull-staged (start it with \
+                 --scheduler-policy push-staged)"
+                    .to_owned(),
+            ));
+        }
 
         self.task_manager
             .submit_plan(job_id, job_name, session_ctx, plan, queued_at, subscriber)

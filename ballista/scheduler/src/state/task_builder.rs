@@ -37,7 +37,9 @@
 //! subtrees never share state and there's no traversal-order dependency.
 
 use ballista_core::execution_plans::plan_algebra::as_partition_sliceable;
-use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
+use ballista_core::execution_plans::{
+    PipelinedShuffleReaderExec, RangeShuffleReaderExec, ShuffleReaderExec,
+};
 use datafusion::common::internal_err;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{
@@ -254,6 +256,15 @@ fn select_output_partitions(
     plan: &Arc<dyn ExecutionPlan>,
     indices: &[usize],
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    // PipelinedShuffleReaderExec: cross-stage inputs of a pipelined job.
+    if let Some(reader) = plan.downcast_ref::<PipelinedShuffleReaderExec>() {
+        // A broadcast reader streams everything into its one partition for
+        // every consumer task; slicing would drop the payload.
+        if reader.broadcast {
+            return Ok(Some(plan.clone()));
+        }
+        return Ok(Some(Arc::new(reader.with_partitions(indices)?)));
+    }
     // ShuffleReaderExec: cross-stage inputs.
     if let Some(reader) = plan.downcast_ref::<ShuffleReaderExec>() {
         // Broadcast readers serve everything from partition[0] for every

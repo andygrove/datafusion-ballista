@@ -149,25 +149,30 @@ impl PipelinedShuffleReaderExec {
         self
     }
 
-    /// Returns a copy that reads only `partitions`, in that order. Used to
-    /// restrict a stage plan to one task's slice of partitions.
+    /// Returns a copy that reads only `partitions`, in that order, skipping
+    /// any it does not have, as the shuffle reader does. Used to restrict a
+    /// stage plan to one task's slice of partitions.
     pub fn with_partitions(&self, partitions: &[usize]) -> Result<Self> {
-        let selected = partitions
+        let selected: Vec<_> = partitions
             .iter()
-            .map(|p| {
-                self.partition.get(*p).cloned().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "PipelinedShuffleReaderExec for stage {} has no partition {p}",
-                        self.stage_id
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .filter_map(|p| self.partition.get(*p).cloned())
+            .collect();
         let partitioning = match self.properties.output_partitioning() {
             Partitioning::Hash(exprs, _) => {
                 Partitioning::Hash(exprs.clone(), selected.len())
             }
-            _ => Partitioning::UnknownPartitioning(selected.len()),
+            Partitioning::RoundRobinBatch(_) => {
+                Partitioning::RoundRobinBatch(selected.len())
+            }
+            Partitioning::UnknownPartitioning(_) => {
+                Partitioning::UnknownPartitioning(selected.len())
+            }
+            Partitioning::Range(_) => {
+                return Err(DataFusionError::Internal(format!(
+                    "cannot restrict a Range-partitioned PipelinedShuffleReaderExec (stage {})",
+                    self.stage_id
+                )));
+            }
         };
         let mut reader = Self::new(
             self.stage_id,
