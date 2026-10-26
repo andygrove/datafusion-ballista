@@ -165,6 +165,24 @@ explanation of the sort-based shuffle writer.
 
 <!-- END GENERATED CONFIG REFERENCE -->
 
+## Pipelined Execution Settings
+
+These session-level keys select and tune the experimental pipelined execution
+mode, in which every task of a job is placed up front and stages stream data
+to each other instead of exchanging shuffle files. See the
+[pipelined execution design page](../contributors-guide/pipelined-execution.md).
+
+<!-- BEGIN GENERATED CONFIG REFERENCE prefix=ballista.execution.,ballista.pipelined. -->
+
+<!-- prettier-ignore -->
+| key                                             | type   | default  | description                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ballista.execution.mode                         | Utf8   | blocking | How a job's stages exchange data. `blocking` runs stages one after another and passes data between them through shuffle files. `pipelined` (experimental) places every task of the job up front and streams record batches between stages over Arrow Flight, for lower latency at the cost of task retries and of running queries wider than the cluster. `pipelined` requires push-staged scheduling. |
+| ballista.pipelined.queue_capacity               | UInt64 | 2        | Number of batches each output partition of a pipelined stage buffers before its producer waits for the consumer to read. Higher values smooth out bursty consumers at the cost of memory.                                                                                                                                                                                                              |
+| ballista.pipelined.registration_timeout_seconds | UInt64 | 60       | How long a pipelined fetch waits for its producer task to start on the executor before failing the query. All tasks of a pipelined job are launched together, so a consumer can ask for data before its producer is running.                                                                                                                                                                           |
+
+<!-- END GENERATED CONFIG REFERENCE -->
+
 ## Testing and Fault Injection
 
 These settings drive chaos-monkey fault injection and exist for robustness
