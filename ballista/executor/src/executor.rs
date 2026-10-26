@@ -41,9 +41,10 @@ use futures::future::AbortHandle;
 use futures::task::AtomicWaker;
 use log::error;
 use log::warn;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 /// A future that resolves when all active tasks on an executor have completed.
@@ -115,6 +116,10 @@ pub struct Executor {
     /// Output partitions of the pipelined producer tasks running here, served
     /// to consumers by the Flight service.
     pipelined_registry: Arc<PipelinedRegistry>,
+
+    /// The runtime each pipelined job's tasks here share, by job id. See
+    /// [`Executor::produce_runtime_for_pipelined_task`].
+    pipelined_runtimes: Arc<parking_lot::Mutex<HashMap<String, Weak<RuntimeEnv>>>>,
 }
 
 impl Executor {
@@ -167,6 +172,7 @@ impl Executor {
             session_runtime_cache: None,
             memory_metrics: None,
             pipelined_registry,
+            pipelined_runtimes: Default::default(),
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -195,6 +201,7 @@ impl Executor {
             session_runtime_cache: None,
             memory_metrics: None,
             pipelined_registry,
+            pipelined_runtimes: Default::default(),
         }
     }
 }
@@ -255,6 +262,31 @@ impl Executor {
             Some(cache) => cache.produce_runtime(session_id, config, vcores_consumed),
             None => (self.runtime_producer)(config),
         }
+    }
+
+    /// Produces the runtime for a task of the pipelined job `job_id`.
+    ///
+    /// A pipelined job's tasks on this executor run at the same time, on one
+    /// reservation of `reserved_vcores`. So they share one runtime, and with it
+    /// one memory pool sized by that reservation: pools sized task by task
+    /// would add up to more than the executor's memory.
+    pub fn produce_runtime_for_pipelined_task(
+        &self,
+        job_id: &str,
+        session_id: &str,
+        config: &SessionConfig,
+        reserved_vcores: u32,
+    ) -> datafusion::error::Result<Arc<RuntimeEnv>> {
+        let mut runtimes = self.pipelined_runtimes.lock();
+        if let Some(runtime) = runtimes.get(job_id).and_then(Weak::upgrade) {
+            return Ok(runtime);
+        }
+        // Forget jobs whose tasks here have all finished.
+        runtimes.retain(|_, runtime| runtime.strong_count() > 0);
+        let runtime =
+            self.produce_runtime_for_session(session_id, config, reserved_vcores)?;
+        runtimes.insert(job_id.to_owned(), Arc::downgrade(&runtime));
+        Ok(runtime)
     }
 
     /// Creates a default [`SessionConfig`] using the configured config producer.
@@ -348,6 +380,7 @@ impl Executor {
     pub fn remove_pipelined_job_data(&self, job_id: &JobId, stage_ids: &[u32]) {
         if stage_ids.is_empty() {
             self.pipelined_registry.remove_job(job_id.as_str());
+            self.pipelined_runtimes.lock().remove(job_id.as_str());
         } else {
             for stage_id in stage_ids {
                 self.pipelined_registry
@@ -742,5 +775,56 @@ mod test {
         let e1 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
         let e2 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
         assert!(!Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
+    }
+
+    #[test]
+    fn pipelined_tasks_of_a_job_share_one_runtime_sized_by_its_reservation() {
+        let executor_registration = ExecutorRegistration {
+            id: "executor".to_string(),
+            ..Default::default()
+        };
+        let config_producer = Arc::new(default_config_producer);
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+        // Records the vcores each new pool is sized for.
+        let sized: Arc<std::sync::Mutex<Vec<u32>>> = Default::default();
+        let recorder = sized.clone();
+        let policy: MemoryPoolPolicy = Arc::new(move |_, _, vcores| {
+            recorder.lock().unwrap().push(vcores);
+            Ok(Arc::new(RuntimeEnv::default()))
+        });
+        let cache: Arc<dyn SessionRuntimeCache> = Arc::new(
+            DefaultSessionRuntimeCache::new(base_producer.clone(), policy, 4),
+        );
+        let executor = Executor::new_basic(
+            executor_registration,
+            "/tmp",
+            base_producer,
+            config_producer,
+            4,
+        )
+        .with_session_runtime_cache(Some(cache));
+
+        let cfg = SessionConfig::new();
+        let first = executor
+            .produce_runtime_for_pipelined_task("job1", "s", &cfg, 3)
+            .unwrap();
+        let second = executor
+            .produce_runtime_for_pipelined_task("job1", "s", &cfg, 3)
+            .unwrap();
+        let other = executor
+            .produce_runtime_for_pipelined_task("job2", "s", &cfg, 1)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(*sized.lock().unwrap(), vec![3, 1]);
+
+        // Once the job's tasks here have finished, its runtime is gone, and
+        // a later task gets a new one.
+        drop((first, second));
+        let _again = executor
+            .produce_runtime_for_pipelined_task("job1", "s", &cfg, 3)
+            .unwrap();
+        assert_eq!(*sized.lock().unwrap(), vec![3, 1, 3]);
     }
 }

@@ -432,6 +432,11 @@ impl PipelinedExecutionGraph {
             }
         }
 
+        let reserved: HashMap<&str, u32> = placement
+            .reservation
+            .iter()
+            .map(|(executor_id, vcores)| (executor_id.as_str(), *vcores))
+            .collect();
         let mut bound = vec![];
         for (stage_id, tasks) in &placement.tasks {
             let stage = self.stage(*stage_id)?;
@@ -452,7 +457,6 @@ impl PipelinedExecutionGraph {
             };
             let plan = resolve_pipelined_readers(stage.plan_arc(), &outputs)?;
             let partitions = stage_input_partitions(&plan);
-            let collapse = stage_has_input_collapse(&plan);
             let mut running = RunningStage::new(
                 *stage_id,
                 0,
@@ -483,8 +487,12 @@ impl PipelinedExecutionGraph {
                         stage_attempt_num: 0,
                         task_attempt: 0,
                         global_input_partition_ids: slice.clone(),
-                        // Sizes the task's memory pool on the executor.
-                        vcores_consumed: if collapse { 1 } else { slice.len() as u32 },
+                        // The job's reservation on the executor, which sizes
+                        // the memory pool all its tasks there share.
+                        vcores_consumed: reserved
+                            .get(executor_id.as_str())
+                            .copied()
+                            .unwrap_or(1),
                         plan: plan.clone(),
                         session_config: self.session_config.clone(),
                     },
@@ -1223,6 +1231,30 @@ mod tests {
         );
         assert!(!graph.take_reservation().is_empty());
         assert!(graph.take_reservation().is_empty(), "released once");
+    }
+
+    #[tokio::test]
+    async fn every_task_on_an_executor_carries_the_jobs_reservation_there() {
+        let mut graph = pipelined_join_graph().await;
+        let requirements = graph.placement_requirements().unwrap();
+        let placement = fits(plan_placement(
+            &requirements,
+            &available(&[("a", 4), ("b", 2)]),
+            6,
+            0,
+        ));
+        let reserved: HashMap<String, u32> =
+            placement.reservation.iter().cloned().collect();
+        let bound = graph.place(&placement, &executors(&["a", "b"])).unwrap();
+        assert!(bound.len() > 2, "{bound:?}");
+        // The executor sizes the memory pool all the job's tasks share from it.
+        for (executor_id, task) in &bound {
+            assert_eq!(
+                task.vcores_consumed, reserved[executor_id],
+                "task {:?} on {executor_id}",
+                task.key
+            );
+        }
     }
 
     #[tokio::test]

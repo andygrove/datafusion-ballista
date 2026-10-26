@@ -214,6 +214,18 @@ land and keep [Current status](#current-status) in step.
     on the workflow's one-executor cluster. That cluster runs push-staged,
     the binaries' default. Its executor has 4 vcores and queries use 16
     partitions, so every stage is wider than the cluster and shares vcores.
+  - **One memory pool per job and executor.** With `--memory-pool-size`
+    set, each blocking task gets a pool of `per_vcore × vcores_consumed`. A
+    pipelined job's tasks all run at once, so pools sized task by task added
+    up to more than the executor's memory. Now every task of the job carries
+    the job's reservation on its executor as `vcores_consumed`. The executor
+    gives all of the job's tasks there one shared runtime
+    (`Executor::produce_runtime_for_pipelined_task`), and so one pool sized
+    by that reservation.
+  - **Launch failures.** When an executor rejects a pipelined task, or the
+    launch call fails, the scheduler no longer refunds a vcore per task.
+    Those vcores belong to the job's reservation, which the job's failure
+    releases, so refunding them too credited the executor twice.
   - **Unclaimed queues time out.** A producer waits on a full queue that no
     consumer has opened only for `ballista.pipelined.registration_timeout_seconds`,
     then fails its task, which fails the job. Before, a client that
@@ -234,18 +246,11 @@ land and keep [Current status](#current-status) in step.
    - The client does not cancel a job when its result stream is dropped.
      The job still ends, because the final stage sees its consumers go, but
      cancelling it on drop would free the cluster sooner.
-3. **Memory pools.** With `--memory-pool-size` set, each task's pool is
-   `per_vcore × vcores_consumed`, which assumes the tasks running on an
-   executor never claim more than its vcores between them. A pipelined
-   job's stages all run at once on one reservation, and a wide stage packs
-   several partitions per vcore, so their pools add up to more than the
-   executor's memory. Pools for a pipelined job should come from its
-   reservation, shared among all its tasks on the executor.
-4. **Flight SQL.** `ballista/scheduler/src/flight_sql.rs` only reads
+3. **Flight SQL.** `ballista/scheduler/src/flight_sql.rs` only reads
    `SuccessfulJob.partition_location`, which is empty for a pipelined job.
    It needs to stream `pipelined_output_locations` while the job runs, as
    `DistributedQueryExec` now does.
-5. **M6: docs and polish.** A user guide page, tuning notes for
+4. **M6: docs and polish.** A user guide page, tuning notes for
    `ballista.pipelined.queue_capacity`, and benchmarks against blocking mode.
 
 ## Design decisions
@@ -299,13 +304,18 @@ relitigated. The design issue [#2652] records the overall architecture.
   is a parked future, not a thread. A `UNION ALL` is as wide as all its
   inputs together, so refusing such stages would fail ordinary queries. The
   cost is that a wide job waits for the whole cluster to be free.
+- **A job's tasks on an executor share one memory pool.** The pool is sized
+  by the job's reservation there, as a blocking task's pool is sized by its
+  own vcores. The tasks run at once, so one shared pool bounds the job's
+  memory there, and per-task pools would not. The executor holds each job's
+  runtime weakly, so it goes away when the job's last task there finishes.
 - **The reservation is held for the whole job.** A pipelined job's vcores are
   reserved once, at placement, and released once, when it ends. Releasing per
   task would hand vcores back while other tasks of the job still run on the
   same executor. The job's task infos carry `vcores_consumed = 0`, so the
   normal per-task refunds stay correct. The `TaskDescription` sent to the
-  executor still carries the slice length, which sizes the task's memory
-  pool.
+  executor carries the job's reservation there, which sizes the memory pool
+  the job's tasks there share.
 - **Placement and reservation never hold two locks.** The placement is planned
   under the graph read lock, the vcores are reserved atomically, and the
   placement is committed under the graph write lock. That avoids the
