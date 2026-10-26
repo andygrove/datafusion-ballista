@@ -28,6 +28,7 @@ use ballista_core::ConfigProducer;
 use ballista_core::JobId;
 use ballista_core::RuntimeProducer;
 use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::PipelinedRegistry;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
 use ballista_core::serde::scheduler::TaskKey;
@@ -110,6 +111,10 @@ pub struct Executor {
     /// Executor-wide memory usage, sampled for heartbeats. Set when the
     /// executor was started with memory metrics enabled.
     memory_metrics: Option<ExecutorMemoryMetrics>,
+
+    /// Output partitions of the pipelined producer tasks running here, served
+    /// to consumers by the Flight service.
+    pipelined_registry: Arc<PipelinedRegistry>,
 }
 
 impl Executor {
@@ -147,6 +152,7 @@ impl Executor {
         vcores: usize,
         execution_engine: Arc<dyn ExecutionEngine>,
     ) -> Self {
+        let pipelined_registry = Arc::new(PipelinedRegistry::new(metadata.id.clone()));
         Self {
             metadata,
             work_dir: work_dir.to_owned(),
@@ -160,6 +166,7 @@ impl Executor {
             execution_engine,
             session_runtime_cache: None,
             memory_metrics: None,
+            pipelined_registry,
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -173,6 +180,7 @@ impl Executor {
         metrics_collector: Arc<dyn ExecutorMetricsCollector>,
         vcores: usize,
     ) -> Self {
+        let pipelined_registry = Arc::new(PipelinedRegistry::new(metadata.id.clone()));
         Self {
             metadata,
             work_dir: work_dir.to_owned(),
@@ -186,6 +194,7 @@ impl Executor {
             execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
             memory_metrics: None,
+            pipelined_registry,
         }
     }
 }
@@ -320,6 +329,31 @@ impl Executor {
     /// Returns the working directory path for this executor.
     pub fn work_dir(&self) -> &str {
         &self.work_dir
+    }
+
+    /// The output partitions of the pipelined producer tasks running on this
+    /// executor.
+    pub fn pipelined_registry(&self) -> &Arc<PipelinedRegistry> {
+        &self.pipelined_registry
+    }
+
+    /// Returns `config` with this executor's pipelined registry attached, which
+    /// is how a task's pipelined writer and readers find it.
+    pub fn with_pipelined_registry(&self, config: SessionConfig) -> SessionConfig {
+        config.with_extension(self.pipelined_registry.clone())
+    }
+
+    /// Forgets the pipelined outputs of `job_id`, or of just `stage_ids` when
+    /// given, once the scheduler has cleaned the job up.
+    pub fn remove_pipelined_job_data(&self, job_id: &JobId, stage_ids: &[u32]) {
+        if stage_ids.is_empty() {
+            self.pipelined_registry.remove_job(job_id.as_str());
+        } else {
+            for stage_id in stage_ids {
+                self.pipelined_registry
+                    .remove_stage(job_id.as_str(), *stage_id as usize);
+            }
+        }
     }
 
     /// Returns the number of tasks currently executing on this executor.

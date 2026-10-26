@@ -434,7 +434,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                     Arc::new(TaskContext::new(
                         Some(task_identity.clone()),
                         task.session_id,
-                        task.session_config,
+                        self.executor.with_pipelined_registry(task.session_config),
                         function_registry.scalar_functions.clone(),
                         function_registry.higher_order_functions.clone(),
                         function_registry.aggregate_functions.clone(),
@@ -1028,6 +1028,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
         let params = request.into_inner();
         let job_id = params.job_id.into();
 
+        self.executor
+            .remove_pipelined_job_data(&job_id, &params.remove_stage_ids);
         remove_job_data(&self.executor.work_dir, &job_id, &params.remove_stage_ids)
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;

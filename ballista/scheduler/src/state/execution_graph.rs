@@ -372,6 +372,7 @@ impl StaticExecutionGraph {
                     queued_at,
                     started_at,
                     scheduler: scheduler_id.to_string(),
+                    pipelined_output_locations: vec![],
                 })),
             },
             queued_at,
