@@ -82,8 +82,10 @@ land and keep [Current status](#current-status) in step.
   - [x] TPC-H SF10 in CI: a `pipelined` leg in `.github/workflows/tpch.yml`.
   - [ ] The TPC-H leg passes.
   - [ ] Cancellation.
-- [ ] **M6: Docs and polish.** User guide page, tuning notes, benchmarks
-      against blocking mode, and removal of the tracking sections.
+- [ ] **M6: Docs and polish.**
+  - [x] User guide page: `docs/source/user-guide/pipelined-execution.md`.
+  - [ ] Tuning notes and benchmarks against blocking mode.
+  - [ ] Remove the tracking sections from this page.
 
 ## Current status
 
@@ -254,8 +256,10 @@ land and keep [Current status](#current-status) in step.
    - The client does not cancel a job when its result stream is dropped.
      The job still ends, because the final stage sees its consumers go, but
      cancelling it on drop would free the cluster sooner.
-3. **M6: docs and polish.** A user guide page, tuning notes for
-   `ballista.pipelined.queue_capacity`, and benchmarks against blocking mode.
+3. **M6: benchmarks and tuning.** The TPC-H SF10 workflow prints each
+   query's time for every leg, so its `pipelined` leg against `AQE off` is a
+   first comparison. Add tuning notes for `ballista.pipelined.queue_capacity`
+   to the user guide page once there are numbers.
 
 ## Design decisions
 
