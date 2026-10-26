@@ -585,12 +585,14 @@ struct PipelinedFetch {
 ///
 /// One connection is opened per executor (or per proxy) and every partition
 /// it serves is multiplexed over it. If `failure` reports that the job
-/// failed, the stream ends with that error.
+/// failed, the stream ends with that error. If the stream is dropped before
+/// it ends, the job is cancelled through `scheduler`.
 fn pipelined_results(
     job_id: JobId,
     locations: Vec<crate::serde::protobuf::PipelinedPartitionLocation>,
     fetch: PipelinedFetch,
     failure: Option<tokio::sync::oneshot::Receiver<String>>,
+    scheduler: Option<SchedulerClient>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     let locations = locations
         .into_iter()
@@ -653,21 +655,49 @@ fn pipelined_results(
             .boxed()
         });
     let data = futures::stream::select_all(per_endpoint).boxed();
-    Ok(Box::pin(PipelinedResults {
-        job_id,
-        data,
-        failure,
-        done: false,
-    }))
+    Ok(Box::pin(PipelinedResults::new(
+        job_id, data, failure, scheduler,
+    )))
 }
 
+/// How long a pipelined result stream whose fetch failed waits for the job's
+/// own failure, which says better what went wrong.
+const JOB_FAILURE_GRACE: Duration = Duration::from_secs(5);
+
 /// A pipelined job's result stream, cut short with the job's error if the
-/// scheduler reports that it failed.
+/// scheduler reports that it failed, and cancelling the job if it is dropped
+/// before it ends.
 struct PipelinedResults {
     job_id: JobId,
     data: BoxStream<'static, Result<RecordBatch>>,
     failure: Option<tokio::sync::oneshot::Receiver<String>>,
+    /// A fetch failed: its error, reported unless the job's own failure
+    /// arrives before the deadline.
+    fetch_error: Option<(DataFusionError, std::pin::Pin<Box<tokio::time::Sleep>>)>,
+    /// How long to wait for the job's failure after a fetch fails.
+    failure_grace: Duration,
+    /// Cancels the job if the stream is dropped before it ends.
+    scheduler: Option<SchedulerClient>,
     done: bool,
+}
+
+impl PipelinedResults {
+    fn new(
+        job_id: JobId,
+        data: BoxStream<'static, Result<RecordBatch>>,
+        failure: Option<tokio::sync::oneshot::Receiver<String>>,
+        scheduler: Option<SchedulerClient>,
+    ) -> Self {
+        Self {
+            job_id,
+            data,
+            failure,
+            fetch_error: None,
+            failure_grace: JOB_FAILURE_GRACE,
+            scheduler,
+            done: false,
+        }
+    }
 }
 
 impl Stream for PipelinedResults {
@@ -679,27 +709,73 @@ impl Stream for PipelinedResults {
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::future::Future;
         use std::task::Poll;
-        if self.done {
-            return Poll::Ready(None);
-        }
-        if let Some(failure) = self.failure.as_mut() {
-            match std::pin::Pin::new(failure).poll(cx) {
-                Poll::Ready(Ok(reason)) => {
-                    self.done = true;
-                    let msg = format!("Job {} failed: {reason}", self.job_id);
-                    error!("{msg}");
-                    return Poll::Ready(Some(Err(DataFusionError::Execution(msg))));
+        loop {
+            if self.done {
+                return Poll::Ready(None);
+            }
+            if let Some(failure) = self.failure.as_mut() {
+                match std::pin::Pin::new(failure).poll(cx) {
+                    Poll::Ready(Ok(reason)) => {
+                        self.done = true;
+                        let msg = format!("Job {} failed: {reason}", self.job_id);
+                        error!("{msg}");
+                        return Poll::Ready(Some(Err(DataFusionError::Execution(msg))));
+                    }
+                    // The watcher stopped without seeing a failure.
+                    Poll::Ready(Err(_)) => self.failure = None,
+                    Poll::Pending => {}
                 }
-                // The watcher stopped without seeing a failure.
-                Poll::Ready(Err(_)) => self.failure = None,
-                Poll::Pending => {}
+            }
+            let still_watching = self.failure.is_some();
+            if let Some((_, deadline)) = self.fetch_error.as_mut() {
+                if still_watching && deadline.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.done = true;
+                let error = self.fetch_error.take().map(|(error, _)| error);
+                return Poll::Ready(error.map(Err));
+            }
+            match self.data.poll_next_unpin(cx) {
+                // A fetch usually fails because the job did, and the scheduler
+                // cleaned up the producer it read from. The job's error says
+                // why, so give it a moment to arrive.
+                Poll::Ready(Some(Err(error))) if still_watching => {
+                    let deadline = Box::pin(tokio::time::sleep(self.failure_grace));
+                    self.fetch_error = Some((error, deadline));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    self.done = true;
+                    return Poll::Ready(None);
+                }
+                other => return other,
             }
         }
-        let next = self.data.poll_next_unpin(cx);
-        if let Poll::Ready(None) = next {
-            self.done = true;
+    }
+}
+
+impl Drop for PipelinedResults {
+    /// A client that stops reading early wants no more of the job, and its
+    /// producers would otherwise run on until they notice. Cancel it, which
+    /// frees its vcores at once.
+    fn drop(&mut self) {
+        if self.done {
+            return;
         }
-        next
+        if let Some(mut scheduler) = self.scheduler.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let job_id = self.job_id.clone();
+            runtime.spawn(async move {
+                info!(
+                    "Result stream of pipelined job {job_id} dropped early; cancelling it"
+                );
+                cancel_job(&mut scheduler, job_id.as_str()).await;
+            });
+        }
     }
 }
 
@@ -885,6 +961,7 @@ async fn execute_query_pull(
                         registration_timeout,
                     },
                     Some(failure),
+                    Some(scheduler.clone()),
                 );
             }
             Some(job_status::Status::Running(_)) => {
@@ -918,6 +995,7 @@ async fn execute_query_pull(
                         io_retry_wait_time_ms,
                         registration_timeout,
                     },
+                    None,
                     None,
                 );
             }
@@ -1113,6 +1191,7 @@ async fn execute_query_push(
                         registration_timeout,
                     },
                     Some(failure),
+                    Some(scheduler.clone()),
                 );
             }
             Some(job_status::Status::Running(_)) => {
@@ -1145,6 +1224,7 @@ async fn execute_query_push(
                         io_retry_wait_time_ms,
                         registration_timeout,
                     },
+                    None,
                     None,
                 );
             }
@@ -1617,12 +1697,12 @@ mod test {
         use futures::StreamExt;
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Results that never arrive, as when the final stage's producer died.
-        let mut results = PipelinedResults {
-            job_id: "job".into(),
-            data: futures::stream::pending::<datafusion::error::Result<_>>().boxed(),
-            failure: Some(rx),
-            done: false,
-        };
+        let mut results = PipelinedResults::new(
+            "job".into(),
+            futures::stream::pending::<datafusion::error::Result<_>>().boxed(),
+            Some(rx),
+            None,
+        );
         tx.send("task 0 of stage 1 failed".to_owned()).unwrap();
         let err = results.next().await.unwrap().unwrap_err();
         assert!(err.to_string().contains("Job job failed: task 0"), "{err}");
@@ -1636,17 +1716,123 @@ mod test {
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
         // The watcher saw the job succeed and stopped without a failure.
         drop(tx);
-        let batches = PipelinedResults {
-            job_id: "job".into(),
-            data: futures::stream::iter(vec![Ok(one_row_batch()), Ok(one_row_batch())])
-                .boxed(),
-            failure: Some(rx),
-            done: false,
-        }
+        let batches = PipelinedResults::new(
+            "job".into(),
+            futures::stream::iter(vec![Ok(one_row_batch()), Ok(one_row_batch())]).boxed(),
+            Some(rx),
+            None,
+        )
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
         assert_eq!(batches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pipelined_results_prefer_the_job_failure_to_a_fetch_error() {
+        use super::PipelinedResults;
+        use futures::StreamExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // The job failed and its producers were cleaned up, so the fetch
+        // fails first, with an error that does not say why.
+        let mut results = PipelinedResults::new(
+            "job".into(),
+            futures::stream::iter(vec![Err(
+                datafusion::error::DataFusionError::Execution(
+                    "job job has finished on this executor".to_owned(),
+                ),
+            )])
+            .chain(futures::stream::pending())
+            .boxed(),
+            Some(rx),
+            None,
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send("task 0 of stage 1 failed: divide by zero".to_owned())
+        });
+        let err = results.next().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("divide by zero"), "{err}");
+        assert!(results.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipelined_results_report_a_fetch_error_the_job_does_not_explain() {
+        use super::PipelinedResults;
+        use futures::StreamExt;
+        let fetch_error = || {
+            futures::stream::iter(vec![Err(
+                datafusion::error::DataFusionError::Execution(
+                    "connection reset".to_owned(),
+                ),
+            )])
+            .chain(futures::stream::pending())
+            .boxed()
+        };
+
+        // The watcher saw the job end without failing.
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        drop(tx);
+        let mut results =
+            PipelinedResults::new("job".into(), fetch_error(), Some(rx), None);
+        let err = results.next().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("connection reset"), "{err}");
+
+        // The watcher has not heard anything within the grace period.
+        let (_tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let mut results =
+            PipelinedResults::new("job".into(), fetch_error(), Some(rx), None);
+        results.failure_grace = Duration::from_millis(20);
+        let err = results.next().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("connection reset"), "{err}");
+        assert!(results.next().await.is_none());
+    }
+
+    async fn scheduler_client(url: String) -> super::SchedulerClient {
+        let channel = tonic::transport::Endpoint::from_shared(url)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        crate::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient::with_interceptor(
+            channel,
+            crate::extension::BallistaGrpcMetadataInterceptor::default(),
+        )
+    }
+
+    /// A client that stops reading wants no more of the job, so dropping its
+    /// result stream early cancels the job; reading it to the end does not.
+    #[tokio::test]
+    async fn dropping_pipelined_results_early_cancels_the_job() {
+        use super::PipelinedResults;
+        use futures::{StreamExt, TryStreamExt};
+        let scheduler = IncompatibleScheduler::default();
+        let url = scheduler.start().await;
+
+        let finished = PipelinedResults::new(
+            "finished".into(),
+            futures::stream::iter(vec![Ok(one_row_batch())]).boxed(),
+            None,
+            Some(scheduler_client(url.clone()).await),
+        );
+        assert_eq!(finished.try_collect::<Vec<_>>().await.unwrap().len(), 1);
+
+        let mut abandoned = PipelinedResults::new(
+            "abandoned".into(),
+            futures::stream::iter(vec![Ok(one_row_batch())])
+                .chain(futures::stream::pending())
+                .boxed(),
+            None,
+            Some(scheduler_client(url).await),
+        );
+        abandoned.next().await.unwrap().unwrap();
+        drop(abandoned);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.cancelled().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(scheduler.cancelled(), ["abandoned"]);
     }
 
     #[test]

@@ -257,6 +257,15 @@ land and keep [Current status](#current-status) in step.
       cleaned up fails at once instead of waiting out its timeouts.
     - **Placement errors.** An error partway through a placement pass no
       longer drops the tasks of the jobs it had already placed.
+  - **Client hardening.**
+    - A result stream dropped before its end cancels the job, which frees
+      its vcores at once. Before, the job ran on until its producers
+      noticed: at once for partitions the client had opened, and only after
+      the claim timeout for any it had not.
+    - A failed fetch waits up to 5 seconds for the job's own failure and
+      reports that instead. A failed job's data is cleaned up from its
+      executors straight away, so a fetch that arrives late reports only
+      that the job is gone.
   - **Unclaimed queues time out.** A producer waits on a full queue that no
     consumer has opened only for `ballista.pipelined.registration_timeout_seconds`,
     then fails its task, which fails the job. Before, a client that
@@ -274,9 +283,6 @@ land and keep [Current status](#current-status) in step.
 2. **More end-to-end coverage.**
    - Cancelling a running pipelined job releases its vcores and its
      registry entries.
-   - The client does not cancel a job when its result stream is dropped.
-     The job still ends, because the final stage sees its consumers go, but
-     cancelling it on drop would free the cluster sooner.
 3. **M6: benchmarks and tuning.** The TPC-H SF10 workflow prints each
    query's time for every leg, so its `pipelined` leg against `AQE off` is a
    first comparison. Add tuning notes for `ballista.pipelined.queue_capacity`
