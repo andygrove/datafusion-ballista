@@ -332,12 +332,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                     let placed = {
                         let mut graph = job_info.execution_graph.write().await;
                         match graph.as_pipelined_mut() {
-                            Some(pipelined) => pipelined.place(&placement, &executors),
-                            None => Ok(vec![]),
+                            Some(pipelined) if pipelined.awaits_placement() => {
+                                pipelined.place(&placement, &executors).map(Some)
+                            }
+                            _ => Ok(None),
                         }
                     };
                     match placed {
-                        Ok(tasks) => {
+                        Ok(None) => {
+                            // Cancelled or failed since its placement was
+                            // planned, so nothing else will release these.
+                            debug!("Pipelined job {job_id} ended while being placed");
+                            self.executor_manager
+                                .unbind_tasks(placement.reservation)
+                                .await?;
+                        }
+                        Ok(Some(tasks)) => {
                             bound.extend(tasks);
                             // Publishes the final stage's locations to the
                             // client, which reads them while the job runs.

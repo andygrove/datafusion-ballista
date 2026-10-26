@@ -338,10 +338,17 @@ impl PipelinedExecutionGraph {
         matches!(self.status.status, Some(Status::Running(_)))
     }
 
+    /// Whether the job still waits to be placed: running, and not placed yet.
+    /// A job can stop waiting between planning its placement and committing
+    /// it, if it is cancelled or fails meanwhile.
+    pub fn awaits_placement(&self) -> bool {
+        !self.placed && self.is_running()
+    }
+
     /// What placing each stage takes, or `None` once the job is placed or no
     /// longer running.
     pub fn placement_requirements(&self) -> Option<Vec<StageRequirement>> {
-        if self.placed || !self.is_running() {
+        if !self.awaits_placement() {
             return None;
         }
         let mut requirements: Vec<StageRequirement> = self
@@ -382,9 +389,9 @@ impl PipelinedExecutionGraph {
         placement: &Placement,
         executors: &HashMap<String, ExecutorMetadata>,
     ) -> Result<Vec<BoundTask>> {
-        if self.placed {
+        if !self.awaits_placement() {
             return Err(BallistaError::Internal(format!(
-                "pipelined job {} is already placed",
+                "pipelined job {} is already placed or no longer running",
                 self.job_id
             )));
         }
@@ -1231,6 +1238,29 @@ mod tests {
         );
         assert!(!graph.take_reservation().is_empty());
         assert!(graph.take_reservation().is_empty(), "released once");
+    }
+
+    #[tokio::test]
+    async fn a_job_cancelled_while_being_placed_is_not_placed() {
+        let mut graph = pipelined_join_graph().await;
+        let requirements = graph.placement_requirements().unwrap();
+        let placement = fits(plan_placement(
+            &requirements,
+            &available(&[("a", 4), ("b", 4)]),
+            8,
+            0,
+        ));
+        // The client cancels after the scheduler planned the placement and
+        // reserved its vcores, but before it committed it.
+        graph.abort_running("cancelled".to_owned());
+        assert!(!graph.awaits_placement());
+        assert!(graph.place(&placement, &executors(&["a", "b"])).is_err());
+        assert!(
+            matches!(graph.status().status, Some(Status::Failed(_))),
+            "{:?}",
+            graph.status()
+        );
+        assert!(graph.take_reservation().is_empty());
     }
 
     #[tokio::test]
