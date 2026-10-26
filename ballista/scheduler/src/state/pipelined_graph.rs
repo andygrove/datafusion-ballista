@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`PipelinedExecutionGraph`]: the execution graph of a job run with
-//! `ballista.execution.mode = pipelined`.
+//! The execution graph of a job run with `ballista.execution.mode =
+//! pipelined`, [`PipelinedExecutionGraph`].
 //!
 //! A blocking job runs stage by stage, each stage becoming runnable once the
 //! stages it reads have written their shuffle files. A pipelined job instead

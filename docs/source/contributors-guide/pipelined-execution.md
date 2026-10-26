@@ -77,10 +77,10 @@ land and keep [Current status](#current-status) in step.
   - [x] End-to-end tests in `ballista/client/tests/pipelined.rs`: aggregates,
         joins, broadcast joins, unions, sorts, window functions, `LIMIT`, a
         failing query, remote reads, and pull-staged rejection.
-  - [ ] The end-to-end tests pass in CI.
+  - [x] The end-to-end tests pass in CI.
   - [x] A multi-executor cluster, and a client that stops reading early.
   - [x] TPC-H SF10 in CI: a `pipelined` leg in `.github/workflows/tpch.yml`.
-  - [ ] The TPC-H leg passes.
+  - [x] The TPC-H leg passes.
   - [ ] Cancellation.
 - [ ] **M6: Docs and polish.**
   - [x] User guide page: `docs/source/user-guide/pipelined-execution.md`.
@@ -224,20 +224,39 @@ land and keep [Current status](#current-status) in step.
       even its small merge reservation. The leg now runs its executor with an
       8 GB pool. Pipelined jobs still keep to the executor's configured
       budget; the user guide explains the trade-off.
-    - Times from that run, in seconds, one run each on shared runners, so
-      treat them as a rough first look rather than a benchmark. The executor
-      has 4 vcores and each stage 16 partitions, so every pipelined stage is
-      oversubscribed fourfold.
 
-      | Query | Blocking (AQE off) | Pipelined |
-      | ----- | ------------------ | --------- |
-      | 1     | 6.9                | 3.8       |
-      | 2     | 0.9                | 2.7       |
-      | 3     | 3.4                | 4.7       |
-      | 4     | 1.4                | 2.6       |
-      | 5     | 2.1                | 8.6       |
-      | 6     | 0.9                | 0.9       |
-      | 7     | 4.5                | 9.9       |
+  - **CI green** (commit `f45b7a6b`). Every client end-to-end test passes on
+    Linux and macOS. The TPC-H SF10 `pipelined` leg, with its 8 GB pool,
+    matches DataFusion on all 21 queries. Its times, in seconds, against the
+    blocking leg of the same run, one run each on shared runners: a rough
+    first look, not a benchmark. The executor has 4 vcores and each stage 16
+    partitions, so every pipelined stage is oversubscribed fourfold, and
+    the queries use sort-merge joins, whose sorts all spill against one pool
+    in pipelined mode.
+
+    | Query | Blocking (AQE off) | Pipelined |
+    | ----- | ------------------ | --------- |
+    | 1     | 3.7                | 3.9       |
+    | 2     | 0.8                | 3.4       |
+    | 3     | 3.5                | 3.3       |
+    | 4     | 1.5                | 2.1       |
+    | 5     | 2.3                | 8.0       |
+    | 6     | 1.0                | 0.9       |
+    | 7     | 4.8                | 9.5       |
+    | 8     | 2.2                | 9.3       |
+    | 9     | 4.9                | 12.4      |
+    | 10    | 3.5                | 2.7       |
+    | 11    | 0.5                | 2.0       |
+    | 12    | 2.5                | 2.5       |
+    | 13    | 2.6                | 2.3       |
+    | 14    | 1.2                | 1.1       |
+    | 15    | 2.1                | 1.7       |
+    | 17    | 6.3                | 9.6       |
+    | 18    | 9.7                | 10.6      |
+    | 19    | 3.2                | 2.2       |
+    | 20    | 2.4                | 2.4       |
+    | 21    | 8.7                | 18.5      |
+    | 22    | 0.9                | 0.8       |
 
   - **TPC-H.** `.github/workflows/tpch.yml` gains a `pipelined` matrix leg.
     It runs every query but q16 on SF10 with `--verify` against DataFusion,
@@ -302,20 +321,15 @@ land and keep [Current status](#current-status) in step.
 
 ## Next steps
 
-1. **Get the end-to-end tests passing in CI.** On [#2657]
-   (`gh pr checks 2657 -R apache/datafusion-ballista`), check:
-
-   - the "test linux ballista" job, which runs
-     `ballista/client/tests/pipelined.rs`;
-   - the "TPC-H SF10 (pipelined)" job. It uploads the cluster logs when it
-     fails. If 8 GB is still too little for a query, lower the leg's
-     partitions rather than raise the pool further: the runner has 16 GB,
-     and the benchmark's DataFusion check shares it.
-
-   Reading the logs from a Claude Code session needs GitHub's Actions storage
-   hosts (`productionresultssa*.blob.core.windows.net`) on the sandbox
-   allowlist.
-
+1. **Keep CI green.** On [#2657]
+   (`gh pr checks 2657 -R apache/datafusion-ballista`), the pipelined
+   coverage is the "test linux ballista" and "macos test" jobs (client
+   end-to-end tests) and the "TPC-H SF10 (pipelined)" job, which uploads the
+   cluster logs when it fails. If 8 GB becomes too little for a query, lower
+   that leg's partitions rather than raise the pool further: the runner has
+   16 GB, and the benchmark's DataFusion check shares it. Reading the logs
+   from a Claude Code session needs GitHub's Actions storage hosts
+   (`productionresultssa*.blob.core.windows.net`) on the sandbox allowlist.
 2. **Cancellation.** Scheduler tests cover a cancelled job releasing its
    vcores and a waiting job being placed after it. The client's
    cancel-on-drop is exercised end to end by

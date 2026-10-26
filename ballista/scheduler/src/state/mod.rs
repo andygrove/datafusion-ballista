@@ -54,7 +54,8 @@ pub mod execution_graph_dot;
 pub mod execution_stage;
 /// Executor registration and management.
 pub mod executor_manager;
-/// Execution graph of a pipelined job, whose tasks all run at once.
+// Documented in the module itself: outer docs here would make rustdoc
+// resolve the module's intra-doc links from this module instead.
 pub mod pipelined_graph;
 /// Session state management.
 pub mod session_manager;
