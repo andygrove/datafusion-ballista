@@ -885,6 +885,10 @@ impl ExecutionGraph for PipelinedExecutionGraph {
                 self.job_id
             )));
         }
+        let pipelined_output_locations = match &self.status.status {
+            Some(Status::Running(running)) => running.pipelined_output_locations.clone(),
+            _ => vec![],
+        };
         self.end_time = timestamp_millis();
         self.status = JobStatus {
             job_id: self.job_id.to_string(),
@@ -894,6 +898,7 @@ impl ExecutionGraph for PipelinedExecutionGraph {
                 queued_at: self.queued_at,
                 started_at: self.start_time,
                 ended_at: self.end_time,
+                pipelined_output_locations,
             })),
         };
         Ok(())

@@ -1773,6 +1773,11 @@ pub struct SuccessfulJob {
     pub started_at: u64,
     #[prost(uint64, tag = "4")]
     pub ended_at: u64,
+    /// For a pipelined job: where its final stage served each output partition,
+    /// the same as in its running status. A small result can finish before a
+    /// polling client has seen the job running; the client can still read it.
+    #[prost(message, repeated, tag = "5")]
+    pub pipelined_output_locations: ::prost::alloc::vec::Vec<PipelinedPartitionLocation>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct QueuedJob {

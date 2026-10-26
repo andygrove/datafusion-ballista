@@ -1473,6 +1473,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                 queued_at: self.queued_at,
                 started_at: self.start_time,
                 ended_at: self.end_time,
+                pipelined_output_locations: vec![],
             })),
         };
 

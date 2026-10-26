@@ -68,12 +68,17 @@ land and keep [Current status](#current-status) in step.
   - [x] Fail the job on any task failure or lost executor, and cancel
         leftover tasks when the final stage completes.
   - [x] Reject pipelined jobs under pull-staged scheduling.
-- [ ] **M4: Client.** `DistributedQueryExec` reads the final stage while the
+- [x] **M4: Client.** `DistributedQueryExec` reads the final stage while the
       job is running, reads all partitions concurrently, and surfaces a job
       failure from the status stream.
-- [ ] **M5: Tests.** A push-staged standalone cluster for tests, and end-to-end
-      tests: TPC-H correctness, joins, broadcast joins, unions, sort-preserving
-      merges, `LIMIT`, cancellation and task failure.
+- [ ] **M5: Tests.**
+  - [x] Standalone mode runs push-staged when the session asks for pipelined
+        execution.
+  - [x] End-to-end tests in `ballista/client/tests/pipelined.rs`: aggregates,
+        joins, broadcast joins, unions, sorts, window functions, `LIMIT`, a
+        failing query, remote reads, and pull-staged rejection.
+  - [ ] The end-to-end tests pass in CI.
+  - [ ] TPC-H correctness, cancellation, and a multi-executor cluster.
 - [ ] **M6: Docs and polish.** User guide page, tuning notes, benchmarks
       against blocking mode, and removal of the tracking sections.
 
@@ -92,7 +97,6 @@ land and keep [Current status](#current-status) in step.
   - New protobuf messages: `PipelinedShuffleWriterExecNode`,
     `PipelinedShuffleReaderExecNode`, `PipelinedPartitionLocation`,
     `FetchPipelinedPartition`, and `RunningJob.pipelined_output_locations`.
-    Nothing sets the last one yet.
 - **M2 done.**
   - `Executor` owns a `PipelinedRegistry` keyed by its executor id, and
     attaches it to every task's `SessionConfig` as an extension. That is how
@@ -150,43 +154,71 @@ land and keep [Current status](#current-status) in step.
   - a job wider than the cluster failing;
   - a lost executor failing the job;
   - pull-staged rejection.
-- **Not yet end to end.** The client still waits for `SuccessfulJob` before
-  fetching, but a pipelined job's final stage cannot finish until its
-  consumer drains it. So a real pipelined query hangs until M4.
+- **M4 done.** The client is in
+  `ballista/core/src/execution_plans/distributed_query.rs`.
+  - A `Running` status with non-empty `pipelined_output_locations` starts
+    `pipelined_results`. It reads every partition of the final stage at
+    once, with one `BallistaClient` per executor (or per proxy), and merges
+    the streams with `select_all`. The final stage cannot finish until it
+    has been read, so the partitions cannot be read one after another.
+  - Partitions are fetched through `get_client_host_port`, so the scheduler
+    or external Flight proxy is used when one is configured.
+  - A watcher keeps following the job status: the rest of the pushed status
+    stream in push mode, or polling every 50 ms in pull mode. If the job
+    fails, the result stream ends with the job's error.
+  - `SuccessfulJob.pipelined_output_locations` repeats the final stage's
+    locations. A small result can finish before a polling client sees the
+    job running, and the client can still read it, because the final stage
+    keeps its queues until the delayed whole-job cleanup.
+  - The registration timeout the client waits for each partition is the
+    query's `ballista.pipelined.registration_timeout_seconds`.
+- **M5 in progress.**
+  - **Push-staged standalone.** `new_standalone_scheduler_with_builder` picks
+    push-staged when the configuration asks for pipelined execution, and
+    `new_standalone_executor_from_builder` then registers through
+    `executor_server::startup`, with its task-launch gRPC server on a free
+    port. Blocking sessions run pull-staged, as before.
+  - **Scheduler endpoint.** The standalone scheduler now binds its listener
+    before it is built, and advertises `localhost:<port>`. Push-staged
+    executors report task status to the endpoint each launch names, and that
+    used to be the hardcoded `localhost:50050`.
+  - **End-to-end tests.** `ballista/client/tests/pipelined.rs` compares seven
+    queries against blocking mode, with and without
+    `ballista.shuffle.force_remote_read`. It also checks a `LIMIT`, a
+    divide-by-zero reaching the client, and a pull-staged cluster rejecting
+    a pipelined job. The tests set `ballista.standalone.parallelism = 4`, so
+    the four-partition plans fit whatever the machine's core count. They
+    bind sockets, so they have only run in CI.
 
 ## Next steps
 
-1. **M4: client.** In `ballista/core/src/execution_plans/distributed_query.rs`,
-   change `execute_query_push`, and `execute_query_pull` if needed, to act
-   on a `Running` status whose `pipelined_output_locations` is non-empty:
-   - Stream every location concurrently through
-     `BallistaClient::fetch_pipelined_partition`, merged with `select_all`.
-     Reuse the scheduler or external flight proxy when one is configured;
-     `ForwardingBackend` already forwards the new action.
-   - Keep watching the status stream, and end the result stream with an
-     error if the job fails.
-   - Ignore the later `SuccessfulJob`, whose `partition_location` is empty.
-2. **M5: push-staged standalone.**
-   - Add a standalone scheduler and executor pair that runs push-staged, with
-     the executor gRPC server on a random port.
-   - Use it from `SessionContext::standalone()` when the session asks for
-     pipelined mode, or from a test helper in `ballista/client/tests/common`.
-3. **M5: end-to-end tests in `ballista/client/tests`.** These are
-   socket-based, so they run in CI only:
-   - TPC-H-style joins and aggregates;
-   - broadcast joins, unions and `ORDER BY`;
-   - `LIMIT`, cancellation, and a failing UDF.
+1. **Get the end-to-end tests passing in CI.** Check the "test linux
+   ballista" job on [#2657] (`gh pr checks 2657 -R apache/datafusion-ballista`)
+   and fix whatever `ballista/client/tests/pipelined.rs` turns up.
+2. **More end-to-end coverage.**
+   - TPC-H correctness against blocking mode, for example by running the
+     `ballista/client/tests` TPC-H queries in both modes.
+   - Cancelling a running pipelined job releases its vcores and its
+     registry entries.
+   - A multi-executor cluster, so exchanges really cross executors (two
+     standalone executors, or the `testcontainers` cluster tests).
+3. **Flight SQL.** `ballista/scheduler/src/flight_sql.rs` only reads
+   `SuccessfulJob.partition_location`, which is empty for a pipelined job.
+   It needs to stream `pipelined_output_locations` while the job runs, as
+   `DistributedQueryExec` now does.
+4. **M6: docs and polish.** A user guide page, tuning notes for
+   `ballista.pipelined.queue_capacity`, and benchmarks against blocking mode.
 
 ## Design decisions
 
 Decisions made while implementing, with the reason, so they are not
 relitigated. The design issue [#2652] records the overall architecture.
 
-- **Push-staged only.** Standalone mode runs pull-staged, so tests use a
-  push-staged standalone cluster (M5). Under pull-staged scheduling each
-  executor claims work on its own poll, so a job cannot be placed atomically,
-  and the executor's vcore permits would block pipelined tasks that wait on
-  each other.
+- **Push-staged only.** Under pull-staged scheduling each executor claims
+  work on its own poll, so a job cannot be placed atomically, and the
+  executor's vcore permits would block pipelined tasks that wait on each
+  other. Standalone mode therefore runs push-staged when the session asks for
+  pipelined execution.
 - **Bounded queues, not unbounded channels.**
   - Each non-broadcast output partition is a bounded `mpsc` queue (capacity
     `ballista.pipelined.queue_capacity`, in batches), so a slow consumer
@@ -234,6 +266,10 @@ relitigated. The design issue [#2652] records the overall architecture.
   under the graph read lock, the vcores are reserved atomically, and the
   placement is committed under the graph write lock. That avoids the
   vcore-lock-then-graph-lock order that `bind_schedulable_tasks` uses.
+- **The client reads every final partition at once.** A pipelined job's
+  final stage cannot finish until its output is read, so the client cannot
+  wait for `SuccessfulJob` the way blocking mode does, or read partitions one
+  after another.
 - **The fetch responds before the producer exists.** The Flight `do_get` for a
   pipelined partition returns its response at once and waits for the producer
   inside the stream body. A consumer that arrives early is therefore not cut
@@ -250,6 +286,8 @@ where possible. The end-to-end tests run in CI on the draft PR.
 cargo test --profile ci -p ballista-core --lib pipelined
 cargo test --profile ci -p ballista-executor --lib flight_service
 cargo test --profile ci -p ballista-scheduler pipelined
+# End to end; needs sockets
+cargo test --profile ci -p ballista --test pipelined
 ```
 
 ## Open questions
