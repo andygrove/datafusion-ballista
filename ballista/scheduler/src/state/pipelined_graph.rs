@@ -74,6 +74,7 @@ use crate::state::execution_graph::{
 use crate::state::execution_stage::{
     PendingPartitions, RunningStage, stage_input_partitions,
 };
+use crate::state::task_builder::stages_read_whole;
 
 /// What placing one stage of a pipelined job takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,13 +267,21 @@ impl PipelinedExecutionGraph {
         let shuffle_stages =
             planner.plan_query_stages(job_id, plan.clone(), session_config.options())?;
 
-        let mut broadcast_stages = HashSet::new();
+        // Stages whose every output partition more than one task reads in
+        // full: a broadcast join's build side, and the input of a collapse
+        // inside a stage of several tasks, such as a cross join's left side.
+        // Their outputs are kept for each reader rather than queued once.
+        let mut replayed_stages = HashSet::new();
         for stage in &shuffle_stages {
             let stage_plan: Arc<dyn ExecutionPlan> = stage.clone();
             for unresolved in find_unresolved_shuffles(&stage_plan)? {
                 if unresolved.broadcast {
-                    broadcast_stages.insert(unresolved.stage_id);
+                    replayed_stages.insert(unresolved.stage_id);
                 }
+            }
+            // A collapse stage runs as one task, so it reads its inputs once.
+            if !stage_has_input_collapse(&stage_plan) {
+                replayed_stages.extend(stages_read_whole(&stage_plan));
             }
         }
 
@@ -285,7 +294,7 @@ impl PipelinedExecutionGraph {
                     stage.stage_id(),
                     input,
                     stage.shuffle_output_partitioning().cloned(),
-                    broadcast_stages.contains(&stage.stage_id()),
+                    replayed_stages.contains(&stage.stage_id()),
                 )?;
                 Ok(Arc::new(writer) as Arc<dyn ShuffleWriter>)
             })
@@ -1240,6 +1249,83 @@ mod tests {
         assert!(graph.take_reservation().is_empty(), "released once");
     }
 
+    /// Plans `plan` as a pipelined job with `partitions` target partitions.
+    async fn pipelined_graph(
+        plan: LogicalPlan,
+        partitions: usize,
+    ) -> PipelinedExecutionGraph {
+        let config =
+            SessionConfig::new_with_ballista().with_target_partitions(partitions);
+        let state =
+            datafusion::prelude::SessionContext::new_with_config(config.clone()).state();
+        let plan = state
+            .create_physical_plan(&state.optimize(&plan).unwrap())
+            .await
+            .unwrap();
+        PipelinedExecutionGraph::new(
+            "localhost:50050",
+            &"job".into(),
+            "",
+            "session",
+            plan,
+            0,
+            Arc::new(config),
+            &mut DefaultDistributedPlanner::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A cross join reads its left side in full in every task of its stage,
+    /// so that side's producer keeps its output for each of them; a queue
+    /// could be read by only one.
+    #[tokio::test]
+    async fn an_input_every_task_reads_in_full_is_replayed() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("gmv", DataType::UInt64, false),
+        ]);
+        let left = scan_empty_with_partitions(Some("left"), &schema, None, 2)
+            .unwrap()
+            .build()
+            .unwrap();
+        let plan = scan_empty_with_partitions(Some("right"), &schema, None, 2)
+            .unwrap()
+            .cross_join(left)
+            .unwrap()
+            .build()
+            .unwrap();
+        let graph = pipelined_graph(plan, 4).await;
+
+        let mut read_whole = vec![];
+        for stage in graph.stages.values() {
+            let plan = stage.plan_arc();
+            if !stage_has_input_collapse(&plan) {
+                read_whole.extend(stages_read_whole(&plan));
+            }
+        }
+        assert!(
+            !read_whole.is_empty(),
+            "the join stage reads its left side whole"
+        );
+        for stage_id in read_whole {
+            let writer = graph.stages[&stage_id]
+                .plan()
+                .downcast_ref::<PipelinedShuffleWriterExec>()
+                .unwrap();
+            assert!(writer.broadcast(), "stage {stage_id} is not replayed");
+        }
+        // A stage read slice by slice still streams through queues.
+        let queued = graph.stages.values().filter(|stage| {
+            !stage
+                .plan()
+                .downcast_ref::<PipelinedShuffleWriterExec>()
+                .unwrap()
+                .broadcast()
+        });
+        assert!(queued.count() > 0);
+    }
+
     #[tokio::test]
     async fn a_job_cancelled_while_being_placed_is_not_placed() {
         let mut graph = pipelined_join_graph().await;
@@ -1534,6 +1620,75 @@ mod tests {
         })
         .await?;
         assert!(released, "the job's vcores were not released");
+        Ok(())
+    }
+
+    /// The vcores a failed or cancelled job gives back go to a pipelined job
+    /// waiting for them, even though no task report or new job follows to
+    /// prompt another scheduling pass.
+    #[tokio::test]
+    async fn a_waiting_pipelined_job_is_placed_once_the_job_holding_its_vcores_ends()
+    -> Result<()> {
+        use crate::test_utils::{TaskRunner, default_task_runner};
+        for end in ["fail", "cancel"] {
+            // The first job's tasks never report, so it holds its vcores until
+            // it is ended below. Every other job's tasks succeed.
+            let first: Arc<Mutex<Option<String>>> = Arc::default();
+            let succeed = default_task_runner();
+            let runner =
+                TaskRunnerFn::new(move |executor: String, task: MultiTaskDefinition| {
+                    let mut first = first.lock().unwrap();
+                    if *first.get_or_insert_with(|| task.job_id.clone()) == task.job_id {
+                        vec![]
+                    } else {
+                        succeed.run(executor, task)
+                    }
+                });
+            let mut test = pipelined_scheduler(
+                TaskSchedulingPolicy::PushStaged,
+                Some(Arc::new(runner)),
+            )
+            .await;
+            // As wide as the cluster, so each job needs every vcore.
+            test.set_session_option("datafusion.execution.target_partitions", "8")?;
+            let placed = |status: Option<JobStatus>| {
+                matches!(
+                    status.and_then(|s| s.status),
+                    Some(Status::Running(RunningJob { pipelined_output_locations, .. }))
+                        if !pipelined_output_locations.is_empty()
+                )
+            };
+
+            let holder = test.submit("holder", &aggregation(8)).await?;
+            let held = await_condition(Duration::from_millis(20), 100, || async {
+                Ok(test.free_vcores().await? == 0)
+            })
+            .await?;
+            assert!(held, "the first job did not take every vcore");
+            let waiter = test.submit("waiter", &aggregation(8)).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !placed(test.job_status(&waiter).await?),
+                "{end}: placed too early"
+            );
+
+            if end == "fail" {
+                test.post_scheduler_event(QueryStageSchedulerEvent::JobRunningFailed {
+                    job_id: holder,
+                    fail_message: "injected failure".to_owned(),
+                    queued_at: 0,
+                    failed_at: 0,
+                })
+                .await?;
+            } else {
+                test.cancel(&holder).await?;
+            }
+            let ran = await_condition(Duration::from_millis(20), 200, || async {
+                Ok(placed(test.job_status(&waiter).await?))
+            })
+            .await?;
+            assert!(ran, "{end}: the waiting job was never placed");
+        }
         Ok(())
     }
 

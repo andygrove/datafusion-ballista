@@ -25,7 +25,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::writer::IpcWriteOptions;
 use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::sql::server::FlightSqlService;
@@ -752,8 +752,11 @@ impl<B: QueryBackend> FlightSqlService for BallistaFlightSqlService<B> {
                         )
                     },
                 ));
+                // Dictionary columns stay dictionary-encoded, as the schema
+                // the client was promised declares them.
                 let stream = FlightDataEncoderBuilder::new()
                     .with_schema(schema)
+                    .with_dictionary_handling(DictionaryHandling::Resend)
                     .build(batches)
                     .map_err(Status::from);
                 Ok(Response::new(Box::pin(stream) as DoGetStream))

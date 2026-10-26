@@ -39,6 +39,7 @@
 use ballista_core::execution_plans::plan_algebra::as_partition_sliceable;
 use ballista_core::execution_plans::{
     PipelinedShuffleReaderExec, RangeShuffleReaderExec, ShuffleReaderExec,
+    UnresolvedShuffleExec,
 };
 use datafusion::common::internal_err;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -69,6 +70,38 @@ pub fn restrict_plan_to_partitions(
     partitions: &[usize],
 ) -> Result<Arc<dyn ExecutionPlan>> {
     restrict(plan, partitions, /* under_collect */ false)
+}
+
+/// The stages whose output a leaf of the stage plan `plan` reads in full,
+/// in every task of the stage, because the leaf sits below a collapse: the
+/// leaves [`restrict_plan_to_partitions`] leaves unrestricted.
+///
+/// A pipelined producer serves each output partition to a single reader, so
+/// one read in full by every task of a stage with several tasks has to keep
+/// its output for each of them.
+pub(crate) fn stages_read_whole(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, under_collect: bool, found: &mut Vec<usize>) {
+        if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
+            if under_collect {
+                found.push(reader.stage_id);
+            }
+            return;
+        }
+        // The same scopes `restrict` gives each child.
+        let scopes = if !under_collect
+            && (plan.is::<UnionExec>() || as_partition_sliceable(plan).is_some())
+        {
+            vec![false; plan.children().len()]
+        } else {
+            child_scopes(plan, under_collect)
+        };
+        for (child, collect) in plan.children().into_iter().zip(scopes) {
+            walk(child, collect, found);
+        }
+    }
+    let mut found = vec![];
+    walk(plan, false, &mut found);
+    found
 }
 
 /// Recursive worker. `under_collect` is the scope inherited from ancestors:

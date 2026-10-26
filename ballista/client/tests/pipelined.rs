@@ -170,6 +170,13 @@ mod pipelined {
              FROM orders WHERE o_cust < 3 ORDER BY o_cust, o_id",
             false,
         ),
+        // A scalar subquery, joined to every row: each task of the join's
+        // stage reads the subquery's whole result.
+        (
+            "SELECT o_id, o_amount FROM orders \
+             WHERE o_amount > (SELECT avg(o_amount) + 400 FROM orders) ORDER BY o_id",
+            false,
+        ),
     ];
 
     async fn check_matches_blocking(dir: &Path, pipelined: &SessionContext) {

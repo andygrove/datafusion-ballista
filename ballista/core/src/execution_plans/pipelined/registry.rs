@@ -47,6 +47,12 @@ use tokio::sync::{Notify, mpsc, oneshot};
 /// wait on them forever. Remembering the job lets it fail instead.
 const CLOSED_JOB_MEMORY: usize = 1024;
 
+/// How many recently cleaned-up stages of still-running jobs the registry
+/// remembers, for the same reason. When a pipelined job succeeds, the
+/// scheduler cleans up its other stages at once, and cancels their leftover
+/// tasks; one that had not started yet would otherwise start afterwards.
+const CLOSED_STAGE_MEMORY: usize = 4096;
+
 /// Identifies one producer task of a pipelined stage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProducerKey {
@@ -290,6 +296,28 @@ struct RegistryState {
     producers: HashMap<ProducerKey, ProducerSlot>,
     closed_jobs: HashSet<String>,
     closed_order: VecDeque<String>,
+    closed_stages: HashSet<(String, usize)>,
+    closed_stage_order: VecDeque<(String, usize)>,
+}
+
+impl RegistryState {
+    /// Why `key`'s producer can no longer serve, if its job or stage has been
+    /// cleaned up on this executor.
+    fn closed(&self, key: &ProducerKey) -> Option<String> {
+        if self.closed_jobs.contains(&key.job_id) {
+            Some(format!("job {} has finished on this executor", key.job_id))
+        } else if self
+            .closed_stages
+            .contains(&(key.job_id.clone(), key.stage_id))
+        {
+            Some(format!(
+                "stage {} of job {} has finished on this executor",
+                key.stage_id, key.job_id
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 /// Executor-wide registry of the output partitions that running pipelined
@@ -348,10 +376,9 @@ impl PipelinedRegistry {
         outputs: Arc<ProducerOutputs>,
     ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        if state.closed_jobs.contains(&key.job_id) {
+        if let Some(reason) = state.closed(&key) {
             return Err(DataFusionError::Execution(format!(
-                "pipelined producer {key} started after job {} finished on this executor",
-                key.job_id
+                "pipelined producer {key} cannot start: {reason}"
             )));
         }
         match state
@@ -445,11 +472,19 @@ impl PipelinedRegistry {
     /// reclaims a finished job's intermediate stages ahead of the job itself.
     /// Unlike [`Self::remove_job`] it does not mark the job finished.
     pub fn remove_stage(&self, job_id: &str, stage_id: usize) {
-        self.state
-            .lock()
-            .unwrap()
+        let mut state = self.state.lock().unwrap();
+        state
             .producers
             .retain(|key, _| key.job_id != job_id || key.stage_id != stage_id);
+        let stage = (job_id.to_owned(), stage_id);
+        if state.closed_stages.insert(stage.clone()) {
+            state.closed_stage_order.push_back(stage);
+            while state.closed_stage_order.len() > CLOSED_STAGE_MEMORY {
+                if let Some(oldest) = state.closed_stage_order.pop_front() {
+                    state.closed_stages.remove(&oldest);
+                }
+            }
+        }
     }
 
     /// Number of producers registered or waited for. For tests and metrics.
@@ -464,10 +499,9 @@ impl PipelinedRegistry {
     ) -> Result<Arc<ProducerOutputs>> {
         let rx = {
             let mut state = self.state.lock().unwrap();
-            if state.closed_jobs.contains(&key.job_id) {
+            if let Some(reason) = state.closed(key) {
                 return Err(DataFusionError::Execution(format!(
-                    "job {} has finished on this executor; pipelined producer {key} is gone",
-                    key.job_id
+                    "{reason}; pipelined producer {key} is gone"
                 )));
             }
             let slot = state
@@ -486,8 +520,8 @@ impl PipelinedRegistry {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(outputs)) => Ok(outputs),
             Ok(Err(_)) => Err(DataFusionError::Execution(format!(
-                "job {} finished on this executor before pipelined producer {key} started",
-                key.job_id
+                "the stage of pipelined producer {key} finished on this executor \
+                 before the producer started"
             ))),
             Err(_) => Err(DataFusionError::Execution(format!(
                 "timed out after {timeout:?} waiting for pipelined producer {key} to start"
@@ -790,7 +824,34 @@ mod tests {
 
         let (outputs, _sinks) = ProducerOutputs::new(schema(), [0], false, 1, None, WAIT);
         let err = registry.register(key(1), outputs).unwrap_err();
-        assert!(err.to_string().contains("started after job"), "{err}");
+        assert!(err.to_string().contains("cannot start"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_stage_turns_away_its_late_producers_and_consumers() {
+        let registry = PipelinedRegistry::new("local");
+        registry.remove_stage("job", 1);
+
+        let (outputs, _sinks) = ProducerOutputs::new(schema(), [0], false, 1, None, WAIT);
+        let err = registry.register(key(0), outputs).unwrap_err();
+        assert!(err.to_string().contains("cannot start"), "{err}");
+        // A consumer fails at once rather than waiting out its timeout.
+        let err =
+            tokio::time::timeout(Duration::from_secs(1), registry.open(&key(0), 0, WAIT))
+                .await
+                .expect("the consumer should fail at once")
+                .map(|_| ())
+                .unwrap_err();
+        assert!(err.to_string().contains("stage 1 of job job"), "{err}");
+
+        // The job's other stages carry on.
+        let other = ProducerKey {
+            job_id: "job".to_owned(),
+            stage_id: 2,
+            task_id: 0,
+        };
+        let (outputs, _sinks) = ProducerOutputs::new(schema(), [0], false, 1, None, WAIT);
+        registry.register(other, outputs).unwrap();
     }
 
     #[tokio::test]

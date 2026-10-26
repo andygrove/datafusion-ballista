@@ -236,6 +236,27 @@ land and keep [Current status](#current-status) in step.
     `DoGet` opens every partition through the Flight proxy at once and
     merges them. `ballista/scheduler/tests/flight_sql.rs` runs a pipelined
     cluster end to end.
+  - **Review fixes.** A review of the whole branch found:
+    - **Inputs read whole.** A cross or nested-loop join's left side, and
+      anything else below a collapse in a stage of several tasks, is read
+      in full by every task. Each such read opened a read-once queue, so a
+      second task failed the job. Those producers are now replayed like a
+      broadcast side (`task_builder::stages_read_whole`). The client tests
+      gained a scalar-subquery query, which takes this path on the
+      two-executor cluster.
+    - **No reschedule after an abort.** The scheduling pass that follows a
+      task report runs before the job failure that report causes, so a job
+      waiting for a failed job's vcores was never placed. Now a failed or
+      cancelled job's abort posts `ReviveOffers` under push-staged
+      scheduling.
+    - **Dictionaries over Flight.** Arrow Flight hydrates dictionary columns
+      by default, so a remote reader got `Utf8` where the plan declared a
+      dictionary. Both pipelined encoders now resend dictionaries.
+    - **Late leftover tasks.** The registry now remembers removed stages as
+      well as removed jobs. A leftover task that starts after its stage was
+      cleaned up fails at once instead of waiting out its timeouts.
+    - **Placement errors.** An error partway through a placement pass no
+      longer drops the tasks of the jobs it had already placed.
   - **Unclaimed queues time out.** A producer waits on a full queue that no
     consumer has opened only for `ballista.pipelined.registration_timeout_seconds`,
     then fails its task, which fails the job. Before, a client that
@@ -296,6 +317,10 @@ relitigated. The design issue [#2652] records the overall architecture.
   partition in full, so those outputs are retained, unbounded, until job
   cleanup. Their size is bounded by
   `ballista.optimizer.broadcast_join_threshold_bytes`.
+- **So is any output read whole by a stage of several tasks.** A cross or
+  nested-loop join's left side is the usual case. No threshold bounds these,
+  but blocking mode reads the same data once per task too. A collapse stage
+  runs as one task, so it reads through queues.
 - **The registry reaches tasks through `SessionConfig`.** Tasks find the
   executor's registry as a session config extension rather than through plan
   rewriting in the execution engine, so custom engines that leave the plan

@@ -132,6 +132,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> QueryStageSchedul
         Ok(())
     }
 
+    /// Offers the vcores an aborted job gave back to the jobs waiting for
+    /// them. A pipelined job waiting to be placed needs this: the scheduling
+    /// pass that follows a task status report runs before the job failure that
+    /// report causes, and nothing else may come along to run another.
+    async fn revive_after_abort(
+        &self,
+        event_sender: &EventSender<QueryStageSchedulerEvent>,
+    ) -> Result<()> {
+        if self.state.config.is_push_staged_scheduling() {
+            event_sender
+                .post_event(QueryStageSchedulerEvent::ReviveOffers)
+                .await?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "rest-api")]
     pub(crate) fn metrics_collector(&self) -> &dyn SchedulerMetricsCollector {
         self.metrics_collector.as_ref()
@@ -476,6 +492,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                     error!("Fail to abort job {job_id} due to {e:?}");
                 }
                 self.state.clean_up_failed_job(job_id);
+                self.revive_after_abort(&event_sender).await?;
             }
             QueryStageSchedulerEvent::JobUpdated(job_id) => {
                 debug!("Job updated, job_id: [{job_id}]");
@@ -502,6 +519,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                     error!("Fail to cancel job {job_id} due to {e:?}");
                 }
                 self.state.clean_up_failed_job(job_id);
+                self.revive_after_abort(&event_sender).await?;
             }
             QueryStageSchedulerEvent::TaskUpdating(executor_id, tasks_status) => {
                 trace!(

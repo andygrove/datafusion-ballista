@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::io::ReaderStream;
 
-use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
 use ballista_core::error::BallistaError;
 use ballista_core::execution_plans::sort_shuffle::{
@@ -164,6 +164,10 @@ impl ResultBackend for LocalDiskBackend {
                         FlightDataEncoderBuilder::new()
                             .with_schema(schema)
                             .with_options(options)
+                            // Keep dictionary columns dictionary-encoded: the
+                            // reader declares the producer's schema, which a
+                            // hydrated stream would not match.
+                            .with_dictionary_handling(DictionaryHandling::Resend)
                             .build(batches)
                             .map_err(|err| Status::from_error(Box::new(err))),
                     )
@@ -736,6 +740,58 @@ mod tests {
         write.unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 100);
+    }
+
+    /// Arrow Flight hydrates dictionary columns by default, which would hand a
+    /// remote reader a different type than the producer's schema declares.
+    #[tokio::test]
+    async fn do_get_keeps_pipelined_dictionary_columns_dictionary_encoded() {
+        use datafusion::arrow::array::{Array, DictionaryArray};
+        use datafusion::arrow::datatypes::UInt16Type;
+
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            dictionary.clone(),
+            false,
+        )]));
+        let values: DictionaryArray<UInt16Type> =
+            vec!["a", "b", "a", "c"].into_iter().collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+        let registry = Arc::new(PipelinedRegistry::new("executor"));
+        let writer =
+            PipelinedShuffleWriterExec::try_new("job".into(), 1, input, None, false)
+                .unwrap()
+                .with_registry(registry.clone());
+        let service = BallistaFlightService::new("/tmp".to_owned())
+            .with_pipelined_registry(registry);
+
+        let fetch = async {
+            let response = service
+                .do_get(Request::new(fetch_ticket(0)))
+                .await
+                .unwrap()
+                .into_inner();
+            FlightRecordBatchStream::new_from_flight_data(response.map_err(Into::into))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+        let ctx = SessionContext::new_with_config(SessionConfig::new()).task_ctx();
+        let (batches, write) = tokio::join!(fetch, writer.execute_pipelined(ctx));
+        write.unwrap();
+        assert_eq!(batches.len(), 1);
+        let column = batches[0].column(0);
+        assert_eq!(column.data_type(), &dictionary);
+        let column = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt16Type>>()
+            .unwrap();
+        assert_eq!(column.len(), 4);
+        assert_eq!(column.values().len(), 3);
     }
 
     #[tokio::test]

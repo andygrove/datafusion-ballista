@@ -280,100 +280,106 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         let mut bound = vec![];
         let mut candidates = None;
         for (job_id, job_info) in running_jobs.iter() {
-            let Some(job_status::Status::Running(running)) = &job_info.status else {
-                continue;
-            };
-            let queued_at = running.queued_at;
-            let (requirements, max_partitions_per_task) = {
-                let graph = job_info.execution_graph.read().await;
-                let Some(pipelined) = graph.as_pipelined() else {
-                    continue;
+            // An error ends the pass, but the jobs it already placed still get
+            // their tasks launched: they hold their vcores, and wait for them.
+            let result: Result<()> = async {
+                let Some(job_status::Status::Running(running)) = &job_info.status else {
+                    return Ok(());
                 };
-                let Some(requirements) = pipelined.placement_requirements() else {
-                    continue;
+                let queued_at = running.queued_at;
+                let (requirements, max_partitions_per_task) = {
+                    let graph = job_info.execution_graph.read().await;
+                    let Some(pipelined) = graph.as_pipelined() else {
+                        return Ok(());
+                    };
+                    let Some(requirements) = pipelined.placement_requirements() else {
+                        return Ok(());
+                    };
+                    (requirements, pipelined.max_partitions_per_task())
                 };
-                (requirements, pipelined.max_partitions_per_task())
-            };
-            if candidates.is_none() {
-                candidates = Some(self.executor_manager.placement_candidates().await?);
-            }
-            let Some((executors, available)) = &candidates else {
-                continue;
-            };
-            let total_vcores = executors
-                .values()
-                .map(|metadata| metadata.specification.vcores as usize)
-                .sum();
-            match plan_placement(
-                &requirements,
-                available,
-                total_vcores,
-                max_partitions_per_task,
-            ) {
-                PlacementDecision::Wait => {
+                if candidates.is_none() {
+                    candidates =
+                        Some(self.executor_manager.placement_candidates().await?);
+                }
+                let Some((executors, available)) = &candidates else {
+                    return Ok(());
+                };
+                let total_vcores = executors
+                    .values()
+                    .map(|metadata| metadata.specification.vcores as usize)
+                    .sum();
+                let PlacementDecision::Fits(placement) = plan_placement(
+                    &requirements,
+                    available,
+                    total_vcores,
+                    max_partitions_per_task,
+                ) else {
                     debug!("Pipelined job {job_id} does not fit in the free vcores yet");
+                    return Ok(());
+                };
+                if !self
+                    .executor_manager
+                    .reserve_vcores(&placement.reservation)
+                    .await?
+                {
+                    debug!("Free vcores changed while placing pipelined job {job_id}");
+                    candidates = None;
+                    return Ok(());
                 }
-                PlacementDecision::Fits(placement) => {
-                    if !self
-                        .executor_manager
-                        .reserve_vcores(&placement.reservation)
-                        .await?
-                    {
-                        debug!(
-                            "Free vcores changed while placing pipelined job {job_id}"
-                        );
-                        candidates = None;
-                        continue;
+                // Free vcores are lower now; look again for the next job.
+                let Some((executors, _)) = candidates.take() else {
+                    return Ok(());
+                };
+                let placed = {
+                    let mut graph = job_info.execution_graph.write().await;
+                    match graph.as_pipelined_mut() {
+                        Some(pipelined) if pipelined.awaits_placement() => {
+                            pipelined.place(&placement, &executors).map(Some)
+                        }
+                        _ => Ok(None),
                     }
-                    // Free vcores are lower now; look again for the next job.
-                    let Some((executors, _)) = candidates.take() else {
-                        continue;
-                    };
-                    let placed = {
-                        let mut graph = job_info.execution_graph.write().await;
-                        match graph.as_pipelined_mut() {
-                            Some(pipelined) if pipelined.awaits_placement() => {
-                                pipelined.place(&placement, &executors).map(Some)
-                            }
-                            _ => Ok(None),
-                        }
-                    };
-                    match placed {
-                        Ok(None) => {
-                            // Cancelled or failed since its placement was
-                            // planned, so nothing else will release these.
-                            debug!("Pipelined job {job_id} ended while being placed");
-                            self.executor_manager
-                                .unbind_tasks(placement.reservation)
-                                .await?;
-                        }
-                        Ok(Some(tasks)) => {
-                            bound.extend(tasks);
-                            // Publishes the final stage's locations to the
-                            // client, which reads them while the job runs.
-                            sender
-                                .post_event(QueryStageSchedulerEvent::JobUpdated(
-                                    job_id.clone(),
-                                ))
-                                .await?;
-                        }
-                        Err(e) => {
-                            self.executor_manager
-                                .unbind_tasks(placement.reservation)
-                                .await?;
-                            sender
-                                .post_event(QueryStageSchedulerEvent::JobRunningFailed {
-                                    job_id: job_id.clone(),
-                                    fail_message: format!(
-                                        "Failed to place pipelined job {job_id}: {e}"
-                                    ),
-                                    queued_at,
-                                    failed_at: timestamp_millis(),
-                                })
-                                .await?;
-                        }
+                };
+                match placed {
+                    Ok(None) => {
+                        // Ended since its placement was planned, so nothing
+                        // else will release these.
+                        debug!("Pipelined job {job_id} ended while being placed");
+                        self.executor_manager
+                            .unbind_tasks(placement.reservation)
+                            .await?;
+                    }
+                    Ok(Some(tasks)) => {
+                        bound.extend(tasks);
+                        // Publishes the final stage's locations to the client,
+                        // which reads them while the job runs.
+                        sender
+                            .post_event(QueryStageSchedulerEvent::JobUpdated(
+                                job_id.clone(),
+                            ))
+                            .await?;
+                    }
+                    Err(e) => {
+                        self.executor_manager
+                            .unbind_tasks(placement.reservation)
+                            .await?;
+                        sender
+                            .post_event(QueryStageSchedulerEvent::JobRunningFailed {
+                                job_id: job_id.clone(),
+                                fail_message: format!(
+                                    "Failed to place pipelined job {job_id}: {e}"
+                                ),
+                                queued_at,
+                                failed_at: timestamp_millis(),
+                            })
+                            .await?;
                     }
                 }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                error!("Stopped placing pipelined jobs at job {job_id}: {e}");
+                break;
             }
         }
         Ok(bound)
