@@ -226,6 +226,14 @@ land and keep [Current status](#current-status) in step.
     launch call fails, the scheduler no longer refunds a vcore per task.
     Those vcores belong to the job's reservation, which the job's failure
     releases, so refunding them too credited the executor twice.
+  - **Flight SQL.** The scheduler's Flight SQL backend returns a pipelined
+    job's `QueryResult` as soon as the job is running with its final stage's
+    locations, in the new `QueryResult.pipelined_partitions`. The frontend
+    serves all of them through one endpoint, whose ticket (a new
+    `StatementHandle::Pipelined`) names every partition and the schema.
+    `DoGet` opens every partition through the Flight proxy at once and
+    merges them. `ballista/scheduler/tests/flight_sql.rs` runs a pipelined
+    cluster end to end.
   - **Unclaimed queues time out.** A producer waits on a full queue that no
     consumer has opened only for `ballista.pipelined.registration_timeout_seconds`,
     then fails its task, which fails the job. Before, a client that
@@ -246,11 +254,7 @@ land and keep [Current status](#current-status) in step.
    - The client does not cancel a job when its result stream is dropped.
      The job still ends, because the final stage sees its consumers go, but
      cancelling it on drop would free the cluster sooner.
-3. **Flight SQL.** `ballista/scheduler/src/flight_sql.rs` only reads
-   `SuccessfulJob.partition_location`, which is empty for a pipelined job.
-   It needs to stream `pipelined_output_locations` while the job runs, as
-   `DistributedQueryExec` now does.
-4. **M6: docs and polish.** A user guide page, tuning notes for
+3. **M6: docs and polish.** A user guide page, tuning notes for
    `ballista.pipelined.queue_capacity`, and benchmarks against blocking mode.
 
 ## Design decisions
@@ -330,6 +334,11 @@ relitigated. The design issue [#2652] records the overall architecture.
   queue. It does not wait on a slow consumer that has opened its queue;
   that is ordinary backpressure. The producer waits on a reservation in the
   queue rather than a send, so timing out loses no batch.
+- **Flight SQL serves a pipelined result through one endpoint.** A client
+  may read endpoints one at a time, and a pipelined job cannot finish
+  writing one partition until its other partitions are being read. Merging
+  on the scheduler, which every Flight SQL result already passes through,
+  keeps any client from stalling the job.
 - **The fetch responds before the producer exists.** The Flight `do_get` for a
   pipelined partition returns its response at once and waits for the producer
   inside the stream body. A consumer that arrives early is therefore not cut
