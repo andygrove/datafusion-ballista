@@ -211,6 +211,34 @@ land and keep [Current status](#current-status) in step.
     four-partition plans fit whatever the machine's core count. They bind
     sockets, so they have only run in CI.
 
+  - **First CI results** (commit `3f9a3c64`):
+
+    - The client end-to-end tests passed on macOS. On Linux 7 of 8 passed.
+      The one failure was the divide-by-zero test, which looked for
+      "divide by zero" where the scheduler reports `ArrowError(DivideByZero)`.
+      The assertion now accepts both.
+    - The TPC-H SF10 `pipelined` leg matched DataFusion on q1 to q7, then
+      failed q8: "Not enough memory to continue external sort". With sort-merge
+      joins, all of the job's sorts (16 partitions in each of about 17
+      stages) share the 2 GB pool at once, and a late sorter could not get
+      even its small merge reservation. The leg now runs its executor with an
+      8 GB pool. Pipelined jobs still keep to the executor's configured
+      budget; the user guide explains the trade-off.
+    - Times from that run, in seconds, one run each on shared runners, so
+      treat them as a rough first look rather than a benchmark. The executor
+      has 4 vcores and each stage 16 partitions, so every pipelined stage is
+      oversubscribed fourfold.
+
+      | Query | Blocking (AQE off) | Pipelined |
+      | ----- | ------------------ | --------- |
+      | 1     | 6.9                | 3.8       |
+      | 2     | 0.9                | 2.7       |
+      | 3     | 3.4                | 4.7       |
+      | 4     | 1.4                | 2.6       |
+      | 5     | 2.1                | 8.6       |
+      | 6     | 0.9                | 0.9       |
+      | 7     | 4.5                | 9.9       |
+
   - **TPC-H.** `.github/workflows/tpch.yml` gains a `pipelined` matrix leg.
     It runs every query but q16 on SF10 with `--verify` against DataFusion,
     on the workflow's one-executor cluster. That cluster runs push-staged,
@@ -276,10 +304,18 @@ land and keep [Current status](#current-status) in step.
 
 1. **Get the end-to-end tests passing in CI.** On [#2657]
    (`gh pr checks 2657 -R apache/datafusion-ballista`), check:
+
    - the "test linux ballista" job, which runs
      `ballista/client/tests/pipelined.rs`;
    - the "TPC-H SF10 (pipelined)" job. It uploads the cluster logs when it
-     fails.
+     fails. If 8 GB is still too little for a query, lower the leg's
+     partitions rather than raise the pool further: the runner has 16 GB,
+     and the benchmark's DataFusion check shares it.
+
+   Reading the logs from a Claude Code session needs GitHub's Actions storage
+   hosts (`productionresultssa*.blob.core.windows.net`) on the sandbox
+   allowlist.
+
 2. **More end-to-end coverage.**
    - Cancelling a running pipelined job releases its vcores and its
      registry entries.

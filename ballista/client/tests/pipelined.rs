@@ -288,10 +288,10 @@ mod pipelined {
             .collect()
             .await;
         let err = result.expect_err("dividing by zero should fail the query");
-        assert!(
-            err.to_string().to_lowercase().contains("divide by zero"),
-            "{err}"
-        );
+        // The task's error arrives as `Divide by zero error` or, from the
+        // scheduler's failure report, as `ArrowError(DivideByZero)`.
+        let text = err.to_string().to_lowercase().replace(' ', "");
+        assert!(text.contains("dividebyzero"), "{err}");
     }
 
     #[tokio::test]

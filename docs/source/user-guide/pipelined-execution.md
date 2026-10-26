@@ -100,8 +100,13 @@ the mode on it later does not work.
 - **Memory.** With `--memory-pool-size` set, all of a job's tasks on an
   executor share one memory pool, sized by the vcores the job reserved there.
   Every stage of the job holds its state at the same time, such as the hash
-  tables of all its joins, so a pipelined job can need more memory than the
-  same query run in blocking mode.
+  tables of all its joins and the buffers of all its sorts, so a pipelined job
+  can need more memory than the same query run in blocking mode. Sort-heavy
+  plans need the most. For example, TPC-H query 8 at scale factor 10, planned
+  with sort-merge joins over 16 partitions, runs in blocking mode on a 4-vcore
+  executor with a 2 GB pool, but fails in pipelined mode with that pool. Give
+  executors more memory, use fewer partitions, or run such queries in blocking
+  mode.
 
 ## Settings
 
