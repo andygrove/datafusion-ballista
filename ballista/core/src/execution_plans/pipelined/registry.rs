@@ -23,8 +23,12 @@
 //! opens one output partition and streams it. Either side can arrive first:
 //! all tasks of a pipelined job launch together, so a consumer that asks for a
 //! partition before its producer has registered waits for it, up to a timeout.
+//! The same timeout bounds how long a producer waits on a full queue that no
+//! consumer has opened yet, so a consumer that never comes — a client that
+//! disconnected, say — fails the job instead of stalling it forever.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,7 +96,11 @@ impl std::fmt::Debug for ProducerOutputs {
 enum PartitionOutput {
     /// Read once, by the consumer task that owns the partition. Taken out of
     /// the registry when that consumer connects.
-    Queue(Mutex<Option<mpsc::Receiver<Message>>>),
+    Queue {
+        rx: Mutex<Option<mpsc::Receiver<Message>>>,
+        /// Set when the consumer takes `rx`.
+        claimed: Arc<AtomicBool>,
+    },
     /// Read in full by every consumer task, as the build side of a broadcast
     /// join is.
     Replay(Arc<ReplayBuffer>),
@@ -100,7 +108,7 @@ enum PartitionOutput {
 
 /// The producer side of one output partition.
 pub(crate) enum PartitionSink {
-    Queue(mpsc::Sender<Message>),
+    Queue(QueueSink),
     Replay(ReplaySink),
 }
 
@@ -108,25 +116,73 @@ impl PartitionSink {
     /// Sends a batch, waiting while the consumer is behind. Returns `false`
     /// once the consumer has gone away, after which the partition's remaining
     /// output can be discarded.
-    pub(crate) async fn send(&self, batch: RecordBatch) -> bool {
+    ///
+    /// Fails if the queue is full and no consumer has opened it within the
+    /// claim timeout.
+    pub(crate) async fn send(&self, batch: RecordBatch) -> Result<bool> {
         match self {
-            PartitionSink::Queue(tx) => tx.send(Message::Batch(batch)).await.is_ok(),
+            PartitionSink::Queue(queue) => match queue.reserve().await? {
+                Some(permit) => {
+                    permit.send(Message::Batch(batch));
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
             PartitionSink::Replay(sink) => {
                 sink.buffer.push(batch);
-                true
+                Ok(true)
             }
         }
     }
 
-    /// Marks the partition complete.
-    pub(crate) async fn finish(&self) {
+    /// Marks the partition complete. Fails like [`Self::send`].
+    pub(crate) async fn finish(&self) -> Result<()> {
         match self {
-            PartitionSink::Queue(tx) => {
+            PartitionSink::Queue(queue) => {
                 // A consumer that has gone away needs no end marker.
-                let _ = tx.send(Message::End).await;
+                if let Some(permit) = queue.reserve().await? {
+                    permit.send(Message::End);
+                }
             }
             PartitionSink::Replay(sink) => sink.buffer.finish(Ok(())),
         }
+        Ok(())
+    }
+}
+
+/// The producer side of a single-consumer queue.
+pub(crate) struct QueueSink {
+    partition: usize,
+    tx: mpsc::Sender<Message>,
+    claimed: Arc<AtomicBool>,
+    claim_timeout: Duration,
+    /// When the producer stops waiting on a full queue nobody has claimed.
+    claim_deadline: tokio::time::Instant,
+}
+
+impl QueueSink {
+    /// Waits for room in the queue, returning `None` once the consumer has
+    /// gone away.
+    ///
+    /// Until a consumer claims the queue the wait is bounded, because a
+    /// consumer that never comes would otherwise leave the producer, and the
+    /// vcores its job holds, waiting forever. Waiting on a reservation rather
+    /// than a send means a timeout loses no batch.
+    async fn reserve(&self) -> Result<Option<mpsc::Permit<'_, Message>>> {
+        if !self.claimed.load(Ordering::Acquire) {
+            match tokio::time::timeout_at(self.claim_deadline, self.tx.reserve()).await {
+                Ok(permit) => return Ok(permit.ok()),
+                // Claimed just as the deadline passed: wait for the consumer.
+                Err(_) if self.claimed.load(Ordering::Acquire) => {}
+                Err(_) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "no consumer opened output partition {} within {:?}",
+                        self.partition, self.claim_timeout
+                    )));
+                }
+            }
+        }
+        Ok(self.tx.reserve().await.ok())
     }
 }
 
@@ -138,13 +194,18 @@ impl ProducerOutputs {
     /// consumer rather than growing memory. Broadcast outputs are retained in
     /// full instead, because every consumer task reads all of them; their
     /// size is bounded by the planner's broadcast threshold.
+    ///
+    /// A producer waits on a full queue that no consumer has opened only
+    /// until `claim_timeout` from now; then its send fails.
     pub(crate) fn new(
         schema: SchemaRef,
         partitions: impl IntoIterator<Item = usize>,
         broadcast: bool,
         capacity: usize,
         compression: Option<CompressionType>,
+        claim_timeout: Duration,
     ) -> (Arc<Self>, HashMap<usize, PartitionSink>) {
+        let claim_deadline = tokio::time::Instant::now() + claim_timeout;
         let mut outputs = HashMap::new();
         let mut sinks = HashMap::new();
         for partition in partitions {
@@ -154,8 +215,24 @@ impl ProducerOutputs {
                 sinks.insert(partition, PartitionSink::Replay(ReplaySink { buffer }));
             } else {
                 let (tx, rx) = mpsc::channel(capacity.max(1));
-                outputs.insert(partition, PartitionOutput::Queue(Mutex::new(Some(rx))));
-                sinks.insert(partition, PartitionSink::Queue(tx));
+                let claimed = Arc::new(AtomicBool::new(false));
+                outputs.insert(
+                    partition,
+                    PartitionOutput::Queue {
+                        rx: Mutex::new(Some(rx)),
+                        claimed: claimed.clone(),
+                    },
+                );
+                sinks.insert(
+                    partition,
+                    PartitionSink::Queue(QueueSink {
+                        partition,
+                        tx,
+                        claimed,
+                        claim_timeout,
+                        claim_deadline,
+                    }),
+                );
             }
         }
         let outputs = Arc::new(Self {
@@ -196,7 +273,7 @@ impl ProducerOutputs {
     /// no longer needs to hold this producer.
     fn fully_claimed(&self) -> bool {
         self.partitions.values().all(|output| match output {
-            PartitionOutput::Queue(rx) => rx.lock().unwrap().is_none(),
+            PartitionOutput::Queue { rx, .. } => rx.lock().unwrap().is_none(),
             PartitionOutput::Replay(_) => false,
         })
     }
@@ -320,12 +397,13 @@ impl PipelinedRegistry {
         })?;
         let schema = outputs.schema();
         let stream: SendableRecordBatchStream = match output {
-            PartitionOutput::Queue(slot) => {
+            PartitionOutput::Queue { rx: slot, claimed } => {
                 let rx = slot.lock().unwrap().take().ok_or_else(|| {
                     DataFusionError::Internal(format!(
                         "partition {partition} of pipelined producer {key} is already being read"
                     ))
                 })?;
+                claimed.store(true, Ordering::Release);
                 if outputs.fully_claimed() {
                     self.release(key);
                 }
@@ -597,12 +675,13 @@ mod tests {
         // Let the consumer start waiting before the producer registers.
         tokio::task::yield_now().await;
 
-        let (outputs, mut sinks) = ProducerOutputs::new(schema(), [3], false, 2, None);
+        let (outputs, mut sinks) =
+            ProducerOutputs::new(schema(), [3], false, 2, None, WAIT);
         registry.register(key(0), outputs).unwrap();
         let sink = sinks.remove(&3).unwrap();
-        assert!(sink.send(batch(&[1, 2])).await);
-        assert!(sink.send(batch(&[3])).await);
-        sink.finish().await;
+        assert!(sink.send(batch(&[1, 2])).await.unwrap());
+        assert!(sink.send(batch(&[3])).await.unwrap());
+        sink.finish().await.unwrap();
 
         let batches = consumer.await.unwrap().unwrap();
         assert_eq!(values(&batches), vec![1, 2, 3]);
@@ -611,11 +690,12 @@ mod tests {
     #[tokio::test]
     async fn queue_applies_backpressure_until_the_consumer_reads() {
         let registry = PipelinedRegistry::new("local");
-        let (outputs, mut sinks) = ProducerOutputs::new(schema(), [0], false, 1, None);
+        let (outputs, mut sinks) =
+            ProducerOutputs::new(schema(), [0], false, 1, None, WAIT);
         registry.register(key(0), outputs).unwrap();
         let sink = sinks.remove(&0).unwrap();
 
-        assert!(sink.send(batch(&[1])).await);
+        assert!(sink.send(batch(&[1])).await.unwrap());
         // The queue holds one batch, so the second send waits for a reader.
         let blocked =
             tokio::time::timeout(Duration::from_millis(50), sink.send(batch(&[2]))).await;
@@ -631,10 +711,11 @@ mod tests {
     #[tokio::test]
     async fn producer_that_stops_early_fails_the_consumer_instead_of_truncating() {
         let registry = PipelinedRegistry::new("local");
-        let (outputs, mut sinks) = ProducerOutputs::new(schema(), [0], false, 4, None);
+        let (outputs, mut sinks) =
+            ProducerOutputs::new(schema(), [0], false, 4, None, WAIT);
         registry.register(key(0), outputs.clone()).unwrap();
         let sink = sinks.remove(&0).unwrap();
-        assert!(sink.send(batch(&[1])).await);
+        assert!(sink.send(batch(&[1])).await.unwrap());
         outputs.fail(&DataFusionError::Execution("disk on fire".to_owned()));
         drop(sink);
 
@@ -646,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn queue_can_be_opened_once_and_is_released_once_claimed() {
         let registry = PipelinedRegistry::new("local");
-        let (outputs, _sinks) = ProducerOutputs::new(schema(), [0], false, 4, None);
+        let (outputs, _sinks) = ProducerOutputs::new(schema(), [0], false, 4, None, WAIT);
         registry.register(key(0), outputs).unwrap();
         assert_eq!(registry.producer_count(), 1);
 
@@ -658,14 +739,15 @@ mod tests {
     #[tokio::test]
     async fn broadcast_output_replays_to_every_consumer() {
         let registry = PipelinedRegistry::new("local");
-        let (outputs, mut sinks) = ProducerOutputs::new(schema(), [0], true, 1, None);
+        let (outputs, mut sinks) =
+            ProducerOutputs::new(schema(), [0], true, 1, None, WAIT);
         registry.register(key(0), outputs).unwrap();
         let sink = sinks.remove(&0).unwrap();
 
         let early = registry.open(&key(0), 0, WAIT).await.unwrap().stream;
-        assert!(sink.send(batch(&[1, 2])).await);
-        assert!(sink.send(batch(&[3])).await);
-        sink.finish().await;
+        assert!(sink.send(batch(&[1, 2])).await.unwrap());
+        assert!(sink.send(batch(&[3])).await.unwrap());
+        sink.finish().await.unwrap();
         let late = registry.open(&key(0), 0, WAIT).await.unwrap().stream;
 
         for stream in [early, late] {
@@ -677,7 +759,8 @@ mod tests {
     #[tokio::test]
     async fn dropped_broadcast_sink_fails_its_consumers() {
         let registry = PipelinedRegistry::new("local");
-        let (outputs, mut sinks) = ProducerOutputs::new(schema(), [0], true, 1, None);
+        let (outputs, mut sinks) =
+            ProducerOutputs::new(schema(), [0], true, 1, None, WAIT);
         registry.register(key(0), outputs).unwrap();
         let stream = registry.open(&key(0), 0, WAIT).await.unwrap().stream;
         drop(sinks.remove(&0));
@@ -705,7 +788,7 @@ mod tests {
             "{err}"
         );
 
-        let (outputs, _sinks) = ProducerOutputs::new(schema(), [0], false, 1, None);
+        let (outputs, _sinks) = ProducerOutputs::new(schema(), [0], false, 1, None, WAIT);
         let err = registry.register(key(1), outputs).unwrap_err();
         assert!(err.to_string().contains("started after job"), "{err}");
     }
@@ -713,13 +796,63 @@ mod tests {
     #[tokio::test]
     async fn removing_the_job_releases_a_producer_blocked_on_an_unclaimed_queue() {
         let registry = PipelinedRegistry::new("local");
-        let (outputs, mut sinks) = ProducerOutputs::new(schema(), [0], false, 1, None);
+        let (outputs, mut sinks) =
+            ProducerOutputs::new(schema(), [0], false, 1, None, WAIT);
         registry.register(key(0), outputs).unwrap();
         let sink = sinks.remove(&0).unwrap();
-        assert!(sink.send(batch(&[1])).await);
+        assert!(sink.send(batch(&[1])).await.unwrap());
         registry.remove_job("job");
         // The registry held the only receiver; dropping it closes the queue.
-        assert!(!sink.send(batch(&[2])).await);
+        assert!(!sink.send(batch(&[2])).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn producer_gives_up_on_a_full_queue_nobody_opens() {
+        let registry = PipelinedRegistry::new("local");
+        let (outputs, mut sinks) = ProducerOutputs::new(
+            schema(),
+            [0],
+            false,
+            1,
+            None,
+            Duration::from_millis(20),
+        );
+        registry.register(key(0), outputs).unwrap();
+        let sink = sinks.remove(&0).unwrap();
+        // Room in the queue: sending does not need a consumer yet.
+        assert!(sink.send(batch(&[1])).await.unwrap());
+        let err = sink.send(batch(&[2])).await.unwrap_err();
+        assert!(err.to_string().contains("no consumer opened"), "{err}");
+        let err = sink.finish().await.unwrap_err();
+        assert!(err.to_string().contains("no consumer opened"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn opened_queue_waits_for_its_consumer_past_the_claim_timeout() {
+        let registry = PipelinedRegistry::new("local");
+        let (outputs, mut sinks) = ProducerOutputs::new(
+            schema(),
+            [0],
+            false,
+            1,
+            None,
+            Duration::from_millis(20),
+        );
+        registry.register(key(0), outputs).unwrap();
+        let sink = sinks.remove(&0).unwrap();
+        let mut stream = registry.open(&key(0), 0, WAIT).await.unwrap().stream;
+        assert!(sink.send(batch(&[1])).await.unwrap());
+
+        // A slow consumer is backpressure, not a missing one.
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), sink.send(batch(&[2])))
+                .await;
+        assert!(blocked.is_err(), "send should still be waiting");
+        assert_eq!(
+            values(&[stream.try_next().await.unwrap().unwrap()]),
+            vec![1]
+        );
+        assert!(sink.send(batch(&[2])).await.unwrap());
     }
 
     #[tokio::test]

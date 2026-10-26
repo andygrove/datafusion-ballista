@@ -33,7 +33,9 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::{StreamExt, TryStreamExt};
 
 use super::{PipelinedRegistry, PipelinedShuffleReaderExec, PipelinedShuffleWriterExec};
-use crate::config::BALLISTA_PIPELINED_QUEUE_CAPACITY;
+use crate::config::{
+    BALLISTA_PIPELINED_QUEUE_CAPACITY, BALLISTA_PIPELINED_REGISTRATION_TIMEOUT_SECONDS,
+};
 use crate::execution_plans::ChaosExec;
 use crate::extension::SessionConfigExt;
 use crate::serde::scheduler::{
@@ -364,6 +366,33 @@ async fn producer_stops_when_its_consumer_goes_away() {
         .expect("producer should stop once its consumer is gone")
         .unwrap();
     assert!(stats[0].num_rows < 1000, "producer kept sending to nobody");
+}
+
+/// A consumer that never comes, such as a client that disconnected before it
+/// read anything, fails the producer rather than leaving it, and the vcores
+/// its job holds, waiting forever.
+#[tokio::test]
+async fn producer_fails_when_no_consumer_opens_its_full_queue() {
+    let registry = Arc::new(PipelinedRegistry::new(EXECUTOR));
+    let batches = (0..100).map(|i| batch(i * 10..(i + 1) * 10)).collect();
+    let writer = writer(0, input(vec![batches]), None, false, &registry);
+    let mut config = SessionConfig::new_with_ballista();
+    config
+        .options_mut()
+        .set(BALLISTA_PIPELINED_QUEUE_CAPACITY, "1")
+        .unwrap();
+    config
+        .options_mut()
+        .set(BALLISTA_PIPELINED_REGISTRATION_TIMEOUT_SECONDS, "0")
+        .unwrap();
+    let ctx = SessionContext::new_with_config(config).task_ctx();
+
+    let err =
+        tokio::time::timeout(Duration::from_secs(10), writer.execute_pipelined(ctx))
+            .await
+            .expect("producer should give up on a queue nobody opens")
+            .unwrap_err();
+    assert!(err.to_string().contains("no consumer opened"), "{err}");
 }
 
 #[tokio::test]

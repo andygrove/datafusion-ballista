@@ -23,6 +23,7 @@ mod common;
 #[cfg(test)]
 #[cfg(feature = "standalone")]
 mod pipelined {
+    use crate::common::setup_test_cluster_with_executors;
     use ballista::prelude::SessionContextExt;
     use ballista_core::config::{
         BALLISTA_EXECUTION_MODE, BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
@@ -30,10 +31,12 @@ mod pipelined {
     };
     use ballista_core::extension::SessionConfigExt;
     use datafusion::arrow::util::pretty::pretty_format_batches;
-    use datafusion::execution::SessionStateBuilder;
+    use datafusion::execution::{SessionState, SessionStateBuilder};
     use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
+    use futures::StreamExt;
     use std::io::Write;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Writes an `orders` table split over four files, so its scan has four
@@ -57,8 +60,8 @@ mod pipelined {
         }
     }
 
-    async fn context(dir: &Path, options: &[(&str, &str)]) -> SessionContext {
-        // A pipelined job needs a vcore per partition of its widest stage at
+    fn state(options: &[(&str, &str)]) -> SessionState {
+        // A pipelined job wants a vcore per partition of its widest stage at
         // once, so give the standalone executor as many vcores as the plan
         // has partitions, whatever the machine's core count.
         let mut config = SessionConfig::new_with_ballista()
@@ -67,11 +70,40 @@ mod pipelined {
         for (key, value) in options {
             config = config.set_str(key, value);
         }
-        let state = SessionStateBuilder::new()
+        SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
-            .build();
-        let ctx = SessionContext::standalone_with_state(state).await.unwrap();
+            .build()
+    }
+
+    /// A standalone cluster: one scheduler and one executor.
+    async fn context(dir: &Path, options: &[(&str, &str)]) -> SessionContext {
+        let ctx = SessionContext::standalone_with_state(state(options))
+            .await
+            .unwrap();
+        register_tables(&ctx, dir).await;
+        ctx
+    }
+
+    /// A scheduler with `executors` executors of `vcores` vcores each.
+    async fn cluster_context(
+        dir: &Path,
+        options: &[(&str, &str)],
+        executors: usize,
+        vcores: usize,
+    ) -> SessionContext {
+        let state = state(options);
+        let (host, port) =
+            setup_test_cluster_with_executors(&state, executors, vcores).await;
+        let ctx =
+            SessionContext::remote_with_state(&format!("df://{host}:{port}"), state)
+                .await
+                .unwrap();
+        register_tables(&ctx, dir).await;
+        ctx
+    }
+
+    async fn register_tables(ctx: &SessionContext, dir: &Path) {
         ctx.register_csv(
             "orders",
             dir.join("orders").to_str().unwrap(),
@@ -86,7 +118,6 @@ mod pipelined {
         )
         .await
         .unwrap();
-        ctx
     }
 
     async fn rows(ctx: &SessionContext, sql: &str, sorted: bool) -> Vec<String> {
@@ -141,24 +172,22 @@ mod pipelined {
         ),
     ];
 
-    async fn check_matches_blocking(options: &[(&str, &str)]) {
-        let dir = TempDir::new().unwrap();
-        write_tables(dir.path());
-        let blocking = context(dir.path(), &[]).await;
-        let mut pipelined_options = vec![(BALLISTA_EXECUTION_MODE, "pipelined")];
-        pipelined_options.extend_from_slice(options);
-        let pipelined = context(dir.path(), &pipelined_options).await;
-
+    async fn check_matches_blocking(dir: &Path, pipelined: &SessionContext) {
+        let blocking = context(dir, &[]).await;
         for (sql, sorted) in QUERIES {
             let expected = rows(&blocking, sql, *sorted).await;
-            let actual = rows(&pipelined, sql, *sorted).await;
+            let actual = rows(pipelined, sql, *sorted).await;
             assert_eq!(actual, expected, "pipelined result differs for: {sql}");
         }
     }
 
     #[tokio::test]
     async fn pipelined_results_match_blocking() {
-        check_matches_blocking(&[]).await;
+        let dir = TempDir::new().unwrap();
+        write_tables(dir.path());
+        let pipelined =
+            context(dir.path(), &[(BALLISTA_EXECUTION_MODE, "pipelined")]).await;
+        check_matches_blocking(dir.path(), &pipelined).await;
     }
 
     /// Readers normally take co-located producers straight from the
@@ -166,8 +195,63 @@ mod pipelined {
     /// Arrow Flight instead.
     #[tokio::test]
     async fn pipelined_results_match_blocking_over_flight() {
-        check_matches_blocking(&[(BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, "true")])
-            .await;
+        let dir = TempDir::new().unwrap();
+        write_tables(dir.path());
+        let pipelined = context(
+            dir.path(),
+            &[
+                (BALLISTA_EXECUTION_MODE, "pipelined"),
+                (BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, "true"),
+            ],
+        )
+        .await;
+        check_matches_blocking(dir.path(), &pipelined).await;
+    }
+
+    /// Two executors of two vcores each, so every four-partition stage is
+    /// split between them and its exchanges cross executors.
+    #[tokio::test]
+    async fn pipelined_results_match_blocking_across_executors() {
+        let dir = TempDir::new().unwrap();
+        write_tables(dir.path());
+        let pipelined =
+            cluster_context(dir.path(), &[(BALLISTA_EXECUTION_MODE, "pipelined")], 2, 2)
+                .await;
+        check_matches_blocking(dir.path(), &pipelined).await;
+    }
+
+    /// A client that stops reading part-way must not leave its job holding
+    /// vcores: the next job, which needs every vcore, still runs.
+    #[tokio::test]
+    async fn dropping_the_results_early_frees_the_cluster() {
+        let dir = TempDir::new().unwrap();
+        write_tables(dir.path());
+        // Small batches, so the scan stays blocked on its full queues.
+        let ctx = context(
+            dir.path(),
+            &[
+                (BALLISTA_EXECUTION_MODE, "pipelined"),
+                ("datafusion.execution.batch_size", "8"),
+            ],
+        )
+        .await;
+        let mut stream = ctx
+            .sql("SELECT o_id, o_amount FROM orders")
+            .await
+            .unwrap()
+            .execute_stream()
+            .await
+            .unwrap();
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(60),
+            rows(&ctx, "SELECT count(*) FROM orders", false),
+        )
+        .await
+        .expect("the next job did not run: the dropped job kept its vcores");
+        assert!(next.iter().any(|line| line.contains("1000")), "{next:?}");
     }
 
     #[tokio::test]

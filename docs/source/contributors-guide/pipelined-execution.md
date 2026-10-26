@@ -78,7 +78,8 @@ land and keep [Current status](#current-status) in step.
         joins, broadcast joins, unions, sorts, window functions, `LIMIT`, a
         failing query, remote reads, and pull-staged rejection.
   - [ ] The end-to-end tests pass in CI.
-  - [ ] TPC-H correctness, cancellation, and a multi-executor cluster.
+  - [x] A multi-executor cluster, and a client that stops reading early.
+  - [ ] TPC-H correctness and cancellation.
 - [ ] **M6: Docs and polish.** User guide page, tuning notes, benchmarks
       against blocking mode, and removal of the tracking sections.
 
@@ -175,6 +176,7 @@ land and keep [Current status](#current-status) in step.
   - The registration timeout the client waits for each partition is the
     query's `ballista.pipelined.registration_timeout_seconds`.
 - **M5 in progress.**
+
   - **Push-staged standalone.** `new_standalone_scheduler_with_builder` picks
     push-staged when the configuration asks for pipelined execution, and
     `new_standalone_executor_from_builder` then registers through
@@ -185,12 +187,31 @@ land and keep [Current status](#current-status) in step.
     executors report task status to the endpoint each launch names, and that
     used to be the hardcoded `localhost:50050`.
   - **End-to-end tests.** `ballista/client/tests/pipelined.rs` compares seven
-    queries against blocking mode, with and without
-    `ballista.shuffle.force_remote_read`. It also checks a `LIMIT`, a
-    divide-by-zero reaching the client, and a pull-staged cluster rejecting
-    a pipelined job. The tests set `ballista.standalone.parallelism = 4`, so
-    the four-partition plans fit whatever the machine's core count. They
-    bind sockets, so they have only run in CI.
+    queries against blocking mode in three setups:
+
+    - a standalone cluster;
+    - the same with `ballista.shuffle.force_remote_read`;
+    - a scheduler with two executors of two vcores each
+      (`setup_test_cluster_with_executors` in `tests/common`), so every
+      exchange crosses executors.
+
+    It also checks:
+
+    - a `LIMIT`;
+    - a divide-by-zero reaching the client;
+    - a pull-staged cluster rejecting a pipelined job;
+    - a client that drops its results after one batch, after which a job
+      needing every vcore still runs.
+
+    The tests set `ballista.standalone.parallelism = 4`, so the
+    four-partition plans fit whatever the machine's core count. They bind
+    sockets, so they have only run in CI.
+
+  - **Unclaimed queues time out.** A producer waits on a full queue that no
+    consumer has opened only for `ballista.pipelined.registration_timeout_seconds`,
+    then fails its task, which fails the job. Before, a client that
+    disconnected before opening its results left the final stage blocked
+    and the job's vcores reserved forever.
 
 ## Next steps
 
@@ -198,12 +219,13 @@ land and keep [Current status](#current-status) in step.
    ballista" job on [#2657] (`gh pr checks 2657 -R apache/datafusion-ballista`)
    and fix whatever `ballista/client/tests/pipelined.rs` turns up.
 2. **More end-to-end coverage.**
-   - TPC-H correctness against blocking mode, for example by running the
-     `ballista/client/tests` TPC-H queries in both modes.
+   - TPC-H correctness against blocking mode, for example with the
+     benchmark crate's TPC-H queries on generated data.
    - Cancelling a running pipelined job releases its vcores and its
      registry entries.
-   - A multi-executor cluster, so exchanges really cross executors (two
-     standalone executors, or the `testcontainers` cluster tests).
+   - The client does not cancel a job when its result stream is dropped.
+     The job still ends, because the final stage sees its consumers go, but
+     cancelling it on drop would free the cluster sooner.
 3. **Memory pools.** With `--memory-pool-size` set, each task's pool is
    `per_vcore × vcores_consumed`, which assumes the tasks running on an
    executor never claim more than its vcores between them. A pipelined
@@ -284,6 +306,12 @@ relitigated. The design issue [#2652] records the overall architecture.
   final stage cannot finish until its output is read, so the client cannot
   wait for `SuccessfulJob` the way blocking mode does, or read partitions one
   after another.
+- **One timeout bounds both sides of an exchange.** A consumer waits up to
+  `ballista.pipelined.registration_timeout_seconds` for its producer to
+  register. A producer waits the same time for a consumer to open a full
+  queue. It does not wait on a slow consumer that has opened its queue;
+  that is ordinary backpressure. The producer waits on a reservation in the
+  queue rather than a send, so timing out loses no batch.
 - **The fetch responds before the producer exists.** The Flight `do_get` for a
   pipelined partition returns its response at once and waits for the producer
   inside the stream body. A consumer that arrives early is therefore not cut

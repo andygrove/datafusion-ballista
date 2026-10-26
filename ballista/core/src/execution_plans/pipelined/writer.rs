@@ -256,6 +256,7 @@ impl PipelinedShuffleWriterExec {
             self.broadcast,
             capacity,
             compression,
+            ballista_config.pipelined_registration_timeout(),
         );
         let key = ProducerKey {
             job_id: self.job_id.to_string(),
@@ -387,11 +388,10 @@ impl PipelinedShuffleWriterExec {
                     drain(&mut coalescer)
                 };
                 for batch in ready {
-                    output.send(batch, open).await;
+                    output.send(batch, open).await?;
                 }
             }
-            output.sink.finish().await;
-            Ok::<_, DataFusionError>(())
+            output.sink.finish().await
         });
         futures::future::try_join_all(finishing).await?;
         Ok(())
@@ -429,20 +429,21 @@ impl Output {
 
     /// Sends a batch, counting it. Once the consumer is gone the partition is
     /// closed, and `open` counts down so the writer can stop reading input
-    /// nobody wants.
-    async fn send(&self, batch: RecordBatch, open: &AtomicUsize) {
+    /// nobody wants. Fails if the consumer never opens the partition.
+    async fn send(&self, batch: RecordBatch, open: &AtomicUsize) -> Result<()> {
         if !self.is_open() {
-            return;
+            return Ok(());
         }
         let rows = batch.num_rows() as u64;
         let bytes = batch.get_array_memory_size() as u64;
-        if self.sink.send(batch).await {
+        if self.sink.send(batch).await? {
             self.rows.fetch_add(rows, Ordering::Relaxed);
             self.batches.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(bytes, Ordering::Relaxed);
         } else if self.open.swap(false, Ordering::Relaxed) {
             open.fetch_sub(1, Ordering::Relaxed);
         }
+        Ok(())
     }
 }
 
@@ -491,7 +492,7 @@ async fn drive_hashed(
             };
             for batch in ready {
                 let _timer = send_wait.timer();
-                output.send(batch, &open).await;
+                output.send(batch, &open).await?;
             }
         }
         if open.load(Ordering::Relaxed) == 0 {
@@ -523,7 +524,7 @@ async fn drive_passthrough(
         input_rows.add(batch.num_rows());
         {
             let _timer = send_wait.timer();
-            output.send(batch, &open).await;
+            output.send(batch, &open).await?;
         }
         if !output.is_open() {
             break;

@@ -551,10 +551,11 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
         ),
         ConfigEntry::new(
             BALLISTA_PIPELINED_REGISTRATION_TIMEOUT_SECONDS.to_string(),
-            "How long a pipelined fetch waits for its producer task to start on \
-             the executor before failing the query. All tasks of a pipelined \
-             job are launched together, so a consumer can ask for data before \
-             its producer is running."
+            "How long either side of a pipelined exchange waits for the other \
+             before failing the query: a consumer for its producer task to \
+             start, and a producer whose output queue is full for a consumer \
+             to open it. All tasks of a pipelined job are launched together, \
+             so either can be first."
                 .to_string(),
             DataType::UInt64,
             Some(60.to_string()),
@@ -920,8 +921,9 @@ impl BallistaConfig {
             .max(1)
     }
 
-    /// Returns how long a pipelined fetch waits for its producer task to
-    /// register before failing.
+    /// Returns how long a pipelined consumer waits for its producer task to
+    /// register, and a producer with a full queue for its consumer to open
+    /// it, before failing.
     pub fn pipelined_registration_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.get_usize_setting(BALLISTA_PIPELINED_REGISTRATION_TIMEOUT_SECONDS)
