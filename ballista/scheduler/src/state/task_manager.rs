@@ -27,6 +27,9 @@ use crate::state::execution_graph::{
 };
 use crate::state::executor_manager::ExecutorManager;
 use crate::state::pipelined_graph::PipelinedExecutionGraph;
+use crate::state::pipelined_join_selection::{
+    PipelinedJoinSelection, create_pipelined_physical_plan,
+};
 use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
@@ -292,7 +295,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 debug!("Using the static query planner for pipelined job planning");
                 let session_config = Arc::new(ctx.copied_config());
                 let physical_plan =
-                    ctx.state().create_physical_plan(logical_plan).await?;
+                    create_pipelined_physical_plan(&ctx.state(), logical_plan).await?;
                 let physical_plan = BalanceAndPruneFileGroups::new()
                     .optimize(physical_plan, session_config.options())?;
                 let physical_plan =
@@ -312,12 +315,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             }
             SubmitPlan::Physical(physical_plan) if pipelined => {
                 let session_config = Arc::new(ctx.copied_config());
+                let physical_plan = PipelinedJoinSelection::new()
+                    .optimize(physical_plan.clone(), session_config.options())?;
                 Box::new(PipelinedExecutionGraph::new(
                     &self.scheduler_id,
                     job_id,
                     job_name,
                     &ctx.session_id(),
-                    physical_plan.clone(),
+                    physical_plan,
                     queued_at,
                     session_config,
                     &mut planner,

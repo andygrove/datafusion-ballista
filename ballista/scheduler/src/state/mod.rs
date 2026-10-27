@@ -57,6 +57,7 @@ pub mod executor_manager;
 // Documented in the module itself: outer docs here would make rustdoc
 // resolve the module's intra-doc links from this module instead.
 pub mod pipelined_graph;
+pub(crate) mod pipelined_join_selection;
 /// Session state management.
 pub mod session_manager;
 /// Per-task plan rewriter (restrict scan/shuffle-reader to task's slice).

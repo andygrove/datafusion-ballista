@@ -318,6 +318,21 @@ land and keep [Current status](#current-status) in step.
     then fails its task, which fails the job. Before, a client that
     disconnected before opening its results left the final stage blocked
     and the job's vcores reserved forever.
+  - **Size-aware join selection.** A TPC-H SF1000 run on two 8-vcore
+    executors showed every pipelined join planned as a sort-merge join:
+    without AQE, the static planner with `prefer_hash_join = false` never
+    picks a hash join, and the broadcast promotion only applies to hash
+    joins. q8 sorted all 6B `lineitem` rows for a join against 1.3M parts
+    (361 s against 45 s blocking with AQE). Setting `prefer_hash_join`
+    for the whole job fixed q8 and q17 but ran q9 out of memory, because a
+    1.5B-row `orders` build cannot spill. A pipelined job is now planned
+    with hash joins (`create_pipelined_physical_plan`), and
+    `PipelinedJoinSelection` (`ballista/scheduler/src/state/pipelined_join_selection.rs`)
+    turns each partitioned hash join whose estimated build size per
+    partition exceeds `hash_join_max_build_partition_bytes`, or is unknown,
+    back into a sort-merge join over sorted inputs. Small build sides keep
+    their hash join, and the distributed planner promotes those under the
+    broadcast threshold as before.
 
 ## Next steps
 

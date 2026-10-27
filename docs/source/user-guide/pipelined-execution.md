@@ -95,6 +95,18 @@ the mode on it later does not work.
 - **Results.** The client reads every partition of the final stage at once, as
   they are produced. `LIMIT` queries stop the stages feeding them once they
   have enough rows.
+- **Joins.** Without adaptive query execution there are no measured sizes to
+  choose join strategies from, so the scheduler chooses them from planning-time
+  statistics. A join whose build side is estimated to fit under
+  `ballista.optimizer.broadcast_join_threshold_bytes` is a broadcast hash
+  join, one whose build side fits
+  `ballista.optimizer.hash_join_max_build_partition_bytes` in each partition
+  is a partitioned hash join, and any other join, including one whose build
+  size is unknown, is a sort-merge join. A hash table cannot spill and every
+  hash table of a pipelined job is held at once, so a join is only made a
+  hash join when its build side is known to be small.
+  `datafusion.optimizer.prefer_hash_join` does not apply, as under adaptive
+  query execution.
 - **Failures.** A failed task, or a lost executor that ran any of the job's
   tasks, fails the job. Nothing is retried.
 - **Memory.** With `--memory-pool-size` set, all of a job's tasks on an
@@ -119,7 +131,9 @@ the mode on it later does not work.
 `ballista.scheduler.max_partitions_per_task` caps how many partitions each task
 of a pipelined job processes, as it does in blocking mode. Adaptive query
 execution (`ballista.planner.adaptive.enabled`) does not apply to pipelined
-jobs.
+jobs. `ballista.optimizer.hash_join_max_build_partition_bytes` (64 MiB by
+default; 0 turns the check off) bounds the build side of each partitioned hash
+join, as described under Joins above.
 
 See the [configuration reference](configs.md) for every setting.
 
