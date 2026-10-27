@@ -485,6 +485,26 @@ relitigated. The design issue [#2652] records the overall architecture.
   off by its client's request timeout. The consumer's registration timeout
   travels in the ticket.
 
+- **The setting is an enum, `blocking | pipelined`.** "Pipelined" is the
+  term Trino and the literature use for this model, and an enum leaves room
+  for a later mode, such as one that pipelines only some stages. This and the
+  three decisions after it settle the open questions in [#2652].
+- **Each executor reserves the widest stage's vcores, not the whole
+  executor.** Stages waiting on each other use little CPU, and at SF1000 on
+  two executors CPU was not the bottleneck. Reserving whole executors would
+  allow only one pipelined job per executor, which costs too much for the
+  short queries this mode is for. The limiting resource is memory, since
+  every stage's state is resident at once, and the job's memory pool is
+  sized by this reservation.
+- **A job that does not fit waits; it does not fall back to blocking.** A
+  silent fallback would change the job's failure semantics (retries) and its
+  performance depending on cluster load. An opt-in fallback, such as a wait
+  timeout after which the job runs in blocking mode, can be added later.
+- **Producers start eagerly.** Bounded queues already keep a producer from
+  running far ahead of its consumer, and a lazy start would add a round trip
+  before every stage, which hurts the latency case. A consumer that never
+  arrives is handled by `ballista.pipelined.registration_timeout_seconds`.
+
 ## How to test
 
 Socket-based tests (anything that starts a scheduler, executor or gRPC
@@ -498,18 +518,6 @@ cargo test --profile ci -p ballista-scheduler pipelined
 # End to end; needs sockets
 cargo test --profile ci -p ballista --test pipelined
 ```
-
-## Open questions
-
-These are carried over from [#2652]:
-
-1. Is `ballista.execution.mode = blocking | pipelined` the right name and set
-   of values?
-2. Should a pipelined job reserve the largest stage's vcores on each executor,
-   or whole executors?
-3. Should a pipelined job that does not fit right now wait, or fall back to
-   blocking execution?
-4. Should producers start eagerly, or only when a consumer first polls them?
 
 [#2652]: https://github.com/apache/datafusion-ballista/issues/2652
 [#2657]: https://github.com/apache/datafusion-ballista/pull/2657
