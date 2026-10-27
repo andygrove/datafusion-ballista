@@ -80,7 +80,6 @@ Table of content
 
    contributors-guide/architecture
    contributors-guide/shuffle
-   contributors-guide/pipelined-execution
    contributors-guide/dataframe-cache
    contributors-guide/code-organization
    contributors-guide/user-personas

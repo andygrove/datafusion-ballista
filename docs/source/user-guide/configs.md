@@ -170,7 +170,7 @@ explanation of the sort-based shuffle writer.
 These session-level keys select and tune the experimental pipelined execution
 mode, in which every task of a job is placed up front and stages stream data
 to each other instead of exchanging shuffle files. See the
-[pipelined execution design page](../contributors-guide/pipelined-execution.md).
+[pipelined execution guide](pipelined-execution.md).
 
 <!-- BEGIN GENERATED CONFIG REFERENCE prefix=ballista.execution.,ballista.pipelined. -->
 
