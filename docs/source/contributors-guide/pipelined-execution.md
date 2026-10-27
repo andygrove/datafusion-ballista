@@ -333,6 +333,43 @@ land and keep [Current status](#current-status) in step.
     back into a sort-merge join over sorted inputs. Small build sides keep
     their hash join, and the distributed planner promotes those under the
     broadcast threshold as before.
+  - **SF1000 on two executors** (commit `34a1151a`). TPC-H SF1000 on a
+    Kubernetes cluster of two executors with 8 vcores each, a 48 GB pool
+    and a 1 TB spill cap per executor, 16 partitions, data on local disk,
+    one run each. All 22 queries pass. The total was 2450 s, against 3374 s
+    for blocking mode with AQE (0.73x), and 3795 s for pipelined mode
+    before size-aware join selection.
+
+    | Query | Blocking (AQE) | Pipelined, SMJ only | Pipelined |
+    | ----- | -------------- | ------------------- | --------- |
+    | 1     | 27.2           | 26.4                | 26.6      |
+    | 2     | 51.2           | 98.4                | 26.3      |
+    | 3     | 137.4          | 135.0               | 120.3     |
+    | 4     | 51.4           | 46.8                | 16.4      |
+    | 5     | 430.0          | 344.3               | 284.4     |
+    | 6     | 12.6           | 8.6                 | 9.2       |
+    | 7     | 374.4          | 360.8               | 248.4     |
+    | 8     | 45.0           | 361.2               | 151.4     |
+    | 9     | 199.6          | 598.5               | 246.5     |
+    | 10    | 136.6          | 109.5               | 94.5      |
+    | 11    | 55.5           | 85.5                | 23.5      |
+    | 12    | 73.4           | 53.6                | 49.1      |
+    | 13    | 69.9           | 41.5                | 41.5      |
+    | 14    | 19.0           | 15.0                | 14.9      |
+    | 15    | 43.0           | 32.2                | 26.1      |
+    | 16    | 23.8           | 16.0                | 10.0      |
+    | 17    | 225.9          | 374.8               | 157.4     |
+    | 18    | 459.7          | 409.2               | 360.7     |
+    | 19    | 26.2           | 22.6                | 22.1      |
+    | 20    | 63.8           | 57.6                | 49.3      |
+    | 21    | 817.1          | 575.4               | 423.2     |
+    | 22    | 31.6           | 22.1                | 48.1      |
+
+    q8 is the remaining large regression. AQE broadcasts the filtered `part`
+    side once it sees its real size, but the static estimate is too large to
+    broadcast, so pipelined mode shuffles `lineitem` across the network. q22's
+    plan did not change between the last two runs, so its slowdown looks
+    like run-to-run noise.
 
 ## Next steps
 
@@ -342,20 +379,19 @@ land and keep [Current status](#current-status) in step.
    end-to-end tests) and the "TPC-H SF10 (pipelined)" job, which uploads the
    cluster logs when it fails. If 8 GB becomes too little for a query, lower
    that leg's partitions rather than raise the pool further: the runner has
-   16 GB, and the benchmark's DataFusion check shares it. Reading the logs
-   from a Claude Code session needs GitHub's Actions storage hosts
-   (`productionresultssa*.blob.core.windows.net`) on the sandbox allowlist.
+   16 GB, and the benchmark's DataFusion check shares it.
 2. **Cancellation.** Scheduler tests cover a cancelled job releasing its
    vcores and a waiting job being placed after it. The client's
    cancel-on-drop is exercised end to end by
    `dropping_the_results_early_frees_the_cluster`. Nothing yet cancels a
    running job through the scheduler API end to end and checks that its
    registry entries are gone.
-3. **M6: benchmarks and tuning.** The first numbers above oversubscribe every
-   stage fourfold on a single executor. A fair comparison runs pipelined
-   with as many partitions as the cluster has vcores, on more than one
-   executor. Then add tuning notes for `ballista.pipelined.queue_capacity`
-   and executor memory to the user guide page.
+3. **M6: tuning.** The SF1000 run above is the first comparison on more
+   than one executor. Still to do: tuning notes for
+   `ballista.pipelined.queue_capacity` and executor memory in the user guide
+   page, and closing the q8 gap, which needs better static size estimates
+   for filtered build sides or runtime join adaptation within a pipelined
+   job.
 
 ## Design decisions
 
@@ -452,8 +488,8 @@ relitigated. The design issue [#2652] records the overall architecture.
 ## How to test
 
 Socket-based tests (anything that starts a scheduler, executor or gRPC
-server) cannot run inside the Claude Code sandbox. Unit tests avoid sockets
-where possible. The end-to-end tests run in CI on the draft PR.
+server) cannot run in sandboxed environments that forbid binding ports.
+Unit tests avoid sockets where possible. The end-to-end tests run in CI.
 
 ```shell
 cargo test --profile ci -p ballista-core --lib pipelined
