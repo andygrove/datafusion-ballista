@@ -18,6 +18,7 @@ use crate::cache::is_external_stage_id;
 use crate::physical_optimizer::file_group_balance::BalanceAndPruneFileGroups;
 use crate::physical_optimizer::filter_pushdown::FilterPushdown;
 use crate::state::aqe::adapter::BallistaAdapter;
+use crate::state::aqe::adaptive_rules::AdaptiveRules;
 use crate::state::aqe::execution_plan::{
     AdaptiveDatafusionExec, ExchangeExec, RangeRepartitionRouting,
 };
@@ -182,7 +183,8 @@ impl AdaptivePlanner {
     }
 
     /// Creates a new `AdaptivePlanner` over an already-built physical plan,
-    /// with the default physical optimizer rules.
+    /// with the default physical optimizer rules and an embedder's `rules`
+    /// (see [`AdaptiveRules`]).
     ///
     /// This is the physical-plan counterpart of [`Self::try_new`]: the
     /// plan-preparation rules that `try_new` runs while planning the logical
@@ -194,16 +196,19 @@ impl AdaptivePlanner {
     /// are pinned as stage boundaries first ([`PinSubmittedShufflesRule`]);
     /// otherwise DataFusion's `EnforceDistribution` would drop any that no
     /// operator requirement asks for, such as one feeding an extension node.
+    /// The embedder's preparation rules run after that.
     ///
     /// # Arguments
     ///
     /// * `ctx` - The session context
     /// * `plan` - The physical plan for the job.
     /// * `job_id` - The unique identifier for the job.
-    pub fn try_new_from_physical(
+    /// * `rules` - Rules of the embedder's own, if any.
+    pub fn try_new_from_physical_with_rules(
         ctx: &SessionContext,
         plan: Arc<dyn ExecutionPlan>,
         job_id: JobId,
+        rules: Option<&dyn AdaptiveRules>,
     ) -> common::Result<Self> {
         let plan_id_generator = Arc::new(AtomicUsize::new(0));
 
@@ -212,6 +217,10 @@ impl AdaptivePlanner {
         preparation_optimizers.push(Arc::new(PinSubmittedShufflesRule::new(
             plan_id_generator.clone(),
         )));
+        if let Some(rules) = rules {
+            preparation_optimizers
+                .extend(rules.preparation_rules(plan_id_generator.clone()));
+        }
         let plan_preparation_state = Self::create_session_state(
             SessionStateBuilder::from(ctx.state()),
             preparation_optimizers,
@@ -222,11 +231,14 @@ impl AdaptivePlanner {
             |_, _| {},
         )?;
 
+        let replan_rules = rules
+            .map(|rules| rules.replan_rules(plan_id_generator.clone()))
+            .unwrap_or_default();
         Self::try_new_with_optimizers(
             SessionStateBuilder::from(ctx.state()),
             plan,
             job_id,
-            Self::default_optimizers(plan_id_generator),
+            Self::default_optimizers_with(plan_id_generator, replan_rules),
         )
     }
     /// Cancels a stage by its ID.
@@ -554,6 +566,15 @@ impl AdaptivePlanner {
     pub(super) fn default_optimizers(
         plan_id_generator: Arc<AtomicUsize>,
     ) -> Vec<PhysicalOptimizerRuleRef> {
+        Self::default_optimizers_with(plan_id_generator, vec![])
+    }
+
+    /// The default rules, with an embedder's `replan_rules` after join
+    /// selection.
+    fn default_optimizers_with(
+        plan_id_generator: Arc<AtomicUsize>,
+        replan_rules: Vec<PhysicalOptimizerRuleRef>,
+    ) -> Vec<PhysicalOptimizerRuleRef> {
         let mut physical_optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
             vec![];
 
@@ -568,6 +589,11 @@ impl AdaptivePlanner {
         // select actual join implementation based on current runtime information
         physical_optimizers
             .push(Arc::new(SelectJoinRule::new(plan_id_generator.clone())));
+
+        // An embedder's rules for nodes of its own, which see the joins
+        // Ballista selected and run before DataFusion's chain places
+        // repartitions around whatever they change.
+        physical_optimizers.extend(replan_rules);
 
         // add default datafusion set of optimizers
         // physical_optimizers.extend(

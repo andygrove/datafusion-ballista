@@ -19,6 +19,7 @@ use crate::cache::CACHE_DATA_LOST;
 use crate::display::print_stage_metrics;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::timestamp_millis;
+use crate::state::aqe::adaptive_rules::AdaptiveRules;
 use crate::state::aqe::execution_plan::{ExchangeExec, RangeRepartitionRouting};
 use crate::state::aqe::planner::{AdaptivePlanner, AdaptiveStageInfo};
 use crate::state::execution_graph::{
@@ -64,6 +65,7 @@ use std::vec;
 // an AQE optimizer rule in a follow-up PR.
 
 mod adapter;
+pub mod adaptive_rules;
 pub(crate) mod coalesce;
 pub(crate) mod execution_plan;
 pub mod optimizer_rule;
@@ -170,8 +172,9 @@ impl AdaptiveExecutionGraph {
 
     /// Creates a new `ExecutionGraph` from an already-built physical plan.
     ///
-    /// The plan is prepared and staged by [`AdaptivePlanner::try_new_from_physical`];
-    /// the graph has no logical plan to display.
+    /// The plan is prepared and staged by
+    /// [`AdaptivePlanner::try_new_from_physical_with_rules`], with `rules` added to
+    /// Ballista's; the graph has no logical plan to display.
     pub fn try_new_from_physical(
         scheduler_id: &str,
         job_id: &JobId,
@@ -179,9 +182,14 @@ impl AdaptiveExecutionGraph {
         ctx: &SessionContext,
         physical_plan: Arc<dyn ExecutionPlan>,
         queued_at: u64,
+        rules: Option<&dyn AdaptiveRules>,
     ) -> ballista_core::error::Result<Self> {
-        let planner =
-            AdaptivePlanner::try_new_from_physical(ctx, physical_plan, job_id.clone())?;
+        let planner = AdaptivePlanner::try_new_from_physical_with_rules(
+            ctx,
+            physical_plan,
+            job_id.clone(),
+            rules,
+        )?;
 
         Self::try_new_with_planner(
             scheduler_id,
